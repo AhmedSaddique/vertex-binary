@@ -3,16 +3,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CandleChart from "./CandleChart";
 import SignalDial, { DialMode } from "./SignalDial";
-import { outcomeOf } from "@/lib/backtest";
+import { backtest, outcomeOf } from "@/lib/backtest";
+import { detectSignal, sentimentOf } from "@/lib/pattern";
 import {
   BacktestBucket,
   DEFAULT_CONFIG,
   Direction,
   Outcome,
+  PatternConfig,
   Signal,
   SignalResponse,
   SymbolInfo,
 } from "@/lib/types";
+import { RelayState, useBridgeRelay } from "./useBridgeRelay";
 
 interface LogEntry {
   id: string;
@@ -134,9 +137,31 @@ export default function Dashboard() {
     };
   }, []);
 
-  const symbol = useMemo(() => symbols.find((s) => s.id === symbolId), [symbols, symbolId]);
-  const otcSymbols = symbols.filter((s) => s.provider === "quotex");
-  const marketSymbols = symbols.filter((s) => s.provider !== "quotex");
+  // ---- tab-to-tab relay from the userscript (no server storage needed)
+  const { relay, candles: relayCandles } = useBridgeRelay();
+  const allSymbols = useMemo(() => {
+    const local: SymbolInfo[] = relay.assets.map((a) => ({
+      id: `QX:${a.asset}`,
+      label: a.label,
+      provider: "quotex",
+      query: a.asset,
+      kind: "otc",
+      pollMs: 3_000,
+      available: a.live || a.candles > 0,
+      note: "Quotex chart stream relayed from your Quotex tab into this browser. History starts when the bridge connects.",
+    }));
+    const ids = new Set(local.map((s) => s.id));
+    return [...local, ...symbols.filter((s) => !ids.has(s.id))];
+  }, [symbols, relay.assets]);
+  const symbolsRef = useRef(allSymbols);
+  useEffect(() => {
+    symbolsRef.current = allSymbols;
+  }, [allSymbols]);
+
+  const symbol = useMemo(() => allSymbols.find((s) => s.id === symbolId), [allSymbols, symbolId]);
+  const provider = symbol?.provider;
+  const otcSymbols = allSymbols.filter((s) => s.provider === "quotex");
+  const marketSymbols = allSymbols.filter((s) => s.provider !== "quotex");
 
   // ---- risk manager: consecutive losses since last reset
   const consecutiveLosses = useMemo(() => {
@@ -245,6 +270,41 @@ export default function Dashboard() {
 
   // ---- polling loop, aligned to candle closes for slow feeds
   const fetchSignal = useCallback(async () => {
+    // Quotex asset with data relayed into this browser: compute everything locally
+    if (!demo && symbolId.startsWith("QX:")) {
+      const asset = symbolId.slice(3);
+      const raw = relayCandles(asset);
+      if (raw.length >= 10) {
+        const now = Date.now();
+        const last = raw[raw.length - 1];
+        const forming = last.time + 60_000 > now ? last : null;
+        const closed = forming ? raw.slice(0, -1) : raw;
+        const config: PatternConfig = {
+          ...DEFAULT_CONFIG,
+          minScore: settings.minScore,
+          payout: settings.payout,
+          requireStrongC3: settings.requireStrongC3,
+          minWickRatio: settings.minWickRatio,
+        };
+        const sym = symbolsRef.current.find((s) => s.id === symbolId);
+        if (sym) {
+          const resp: SignalResponse = {
+            symbol: sym,
+            serverTime: now,
+            candles: closed.slice(-120),
+            forming,
+            signal: detectSignal(closed, config),
+            sentiment: sentimentOf(closed),
+            backtest: backtest(closed, config),
+            config,
+          };
+          setData(resp);
+          setError(null);
+          processResponse(resp, false);
+          return;
+        }
+      }
+    }
     const q = new URLSearchParams({
       symbol: symbolId,
       minScore: String(settings.minScore),
@@ -273,6 +333,7 @@ export default function Dashboard() {
     settings.minWickRatio,
     processResponse,
     demo,
+    relayCandles,
   ]);
 
   // demo mode switches itself off after the demo candle has expired
@@ -285,7 +346,7 @@ export default function Dashboard() {
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const fast = !symbol || symbol.provider !== "twelvedata";
+    const fast = provider !== "twelvedata";
 
     const loop = async () => {
       await fetchSignal();
@@ -306,7 +367,7 @@ export default function Dashboard() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [fetchSignal, symbol]);
+  }, [fetchSignal, provider]);
 
   // ---- derived UI state
   const sig: Signal | null = data?.signal ?? null;
@@ -436,7 +497,7 @@ export default function Dashboard() {
         <SettingsPanel settings={settings} onChange={setSettings} onClose={() => setShowSettings(false)} />
       )}
 
-      <BridgeBar status={bridge} />
+      <BridgeBar status={bridge} relay={relay} />
 
       {data?.symbol.provider === "quotex" && data.candles.length < 40 && (
         <div className="card px-4 py-3 text-xs text-amber border-amber/40">
@@ -711,37 +772,49 @@ interface BridgeStatus {
   unparsedSamples: { at: number; text: string }[];
 }
 
-function BridgeBar({ status }: { status: BridgeStatus | null }) {
+function BridgeBar({ status, relay }: { status: BridgeStatus | null; relay: RelayState }) {
   const [open, setOpen] = useState(false);
-  const connected = Boolean(status?.connected);
-  const liveAssets = status?.assets.filter((a) => a.live) ?? [];
-  const receivingButUnparsed = connected && (status?.messages ?? 0) > 50 && (status?.parsedMessages ?? 0) === 0;
+  const serverConnected = Boolean(status?.connected);
+  const connected = relay.connected || serverConnected;
+  const liveAssets = relay.connected
+    ? relay.assets.filter((a) => a.live)
+    : (status?.assets.filter((a) => a.live) ?? []);
+  const messages = relay.connected ? relay.messages : (status?.messages ?? 0);
+  const parsed = relay.connected ? relay.parsedMessages : (status?.parsedMessages ?? 0);
+  const receivingButUnparsed = connected && messages > 50 && parsed === 0;
+  const scriptMissing = !relay.scriptPresent;
   return (
     <div className={`card px-4 py-3 text-xs ${connected ? "border-up/40" : ""}`}>
       <div className="flex flex-wrap items-center gap-3">
         <span className={`h-2 w-2 rounded-full ${connected ? "bg-up shadow-[0_0_8px_var(--green)]" : "bg-line"}`} />
         <span className="tracking-widest text-muted">QUOTEX OTC BRIDGE</span>
+        <span
+          className={`rounded-full border px-2 py-0.5 text-[10px] ${relay.scriptPresent ? "border-up/50 text-up" : "border-down/50 text-down"}`}
+          title={
+            relay.scriptPresent
+              ? "The bridge userscript is running on this page: Quotex data is relayed tab-to-tab, no server storage needed"
+              : "The bridge userscript is not running in this browser"
+          }
+        >
+          {relay.scriptPresent ? "script: active" : "script: not installed"}
+        </span>
         {status && (
           <span
-            className={`rounded-full border px-2 py-0.5 text-[10px] ${status.backend === "redis" ? "border-up/50 text-up" : "border-line text-muted"}`}
-            title={
-              status.backend === "redis"
-                ? "Shared storage active: works on Vercel"
-                : "In-memory storage: fine locally, but on Vercel add Upstash Redis or the bridge data is lost between requests"
-            }
+            className="rounded-full border border-line px-2 py-0.5 text-[10px] text-muted"
+            title="Server-side fallback path (used when the tab-to-tab relay is unavailable)"
           >
-            {status.backend === "redis" ? "storage: redis" : "storage: memory"}
+            server: {status.backend}
           </span>
         )}
         {connected ? (
           <span>
-            connected · {liveAssets.length} live asset{liveAssets.length === 1 ? "" : "s"} ·{" "}
-            {status?.parsedMessages ?? 0} parsed / {status?.messages ?? 0} messages
+            connected{relay.connected ? " via relay" : " via server"} · {liveAssets.length} live asset
+            {liveAssets.length === 1 ? "" : "s"} · {parsed} parsed / {messages} messages
           </span>
+        ) : relay.scriptPresent ? (
+          <span className="text-muted">script ready. Open an OTC chart in Quotex in this same browser.</span>
         ) : (
-          <span className="text-muted">
-            not connected. Install the bridge script, then open a chart in Quotex in the same browser.
-          </span>
+          <span className="text-muted">not connected. Install the bridge script (steps below).</span>
         )}
         <a href="/quotex-bridge.user.js" className="ml-auto underline text-cyan" target="_blank" rel="noreferrer">
           Install bridge script
@@ -753,19 +826,29 @@ function BridgeBar({ status }: { status: BridgeStatus | null }) {
       {receivingButUnparsed && (
         <div className="mt-2 text-amber">
           Messages are arriving but no ticks were recognised yet. Open a chart in Quotex; if this persists,
-          share the samples from <a className="underline" href="/api/quotex/status" target="_blank" rel="noreferrer">/api/quotex/status</a> so the parser can be adjusted.
+          copy the samples below and share them so the parser can be adjusted.
+          {relay.unparsed.length > 0 && (
+            <pre className="mt-1 max-h-32 overflow-auto rounded bg-black/40 p-2 text-[10px] text-muted whitespace-pre-wrap break-all">
+              {relay.unparsed.join("\n\n")}
+            </pre>
+          )}
         </div>
       )}
-      {open && (
+      {(open || scriptMissing) && (
         <ol className="mt-3 list-decimal ml-5 space-y-1 text-muted leading-relaxed">
-          <li>Install the Tampermonkey extension in Chrome or Edge.</li>
-          <li>Click <b>Install bridge script</b> above and confirm in Tampermonkey.</li>
+          <li>
+            Install the <b>Tampermonkey</b> extension in Chrome or Edge. In Chrome, also switch on{" "}
+            <b>Developer mode</b> at <span className="mono">chrome://extensions</span> (top right), otherwise
+            Tampermonkey scripts never run.
+          </li>
+          <li>Click <b>Install bridge script</b> above and confirm in Tampermonkey. Then reload this page:
+            the badge above should read <b>script: active</b>.</li>
           <li>Log in to Quotex yourself in that browser and open the OTC chart you want to trade. A small
             green “Vertex bridge” badge appears bottom‑right on the Quotex page.</li>
           <li>The asset appears in the pair list here under <b>Quotex OTC</b> within a few seconds.
-            Each chart you open in Quotex is added.</li>
-          <li>The script is read‑only: it copies chart messages your browser already receives to this app
-            on your PC and never sends anything to Quotex or reads your login.</li>
+            Each chart you open in Quotex is added. Keep the Quotex tab open.</li>
+          <li>The script is read‑only: it copies chart messages your browser already receives into this
+            page and never sends anything to Quotex or reads your login.</li>
         </ol>
       )}
     </div>
