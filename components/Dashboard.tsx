@@ -6,6 +6,8 @@ import SignalDial, { DialMode } from "./SignalDial";
 import { backtest, outcomeOf } from "@/lib/backtest";
 import { detectSignal, sentimentOf } from "@/lib/pattern";
 import { Prediction, predictNext } from "@/lib/predict";
+import { rankRows, scanAsset } from "@/lib/scan";
+import ScannerBoard from "./ScannerBoard";
 import {
   Candle,
   Sentiment,
@@ -37,6 +39,8 @@ type Mode = "pattern" | "every";
 
 interface Settings {
   mode: Mode;
+  /** scanner: switch the main signal to the best-ranked bridged pair automatically */
+  autoFollow: boolean;
   minScore: number;
   payout: number;
   requireStrongC3: boolean;
@@ -48,6 +52,7 @@ interface Settings {
 
 const DEFAULT_SETTINGS: Settings = {
   mode: "every",
+  autoFollow: true,
   minScore: DEFAULT_CONFIG.minScore,
   payout: DEFAULT_CONFIG.payout,
   requireStrongC3: DEFAULT_CONFIG.requireStrongC3,
@@ -215,6 +220,34 @@ export default function Dashboard() {
 
   const symbol = useMemo(() => allSymbols.find((s) => s.id === symbolId), [allSymbols, symbolId]);
   const provider = symbol?.provider;
+
+  // ---- multi-asset scan of every bridged pair (recomputed every 3 s)
+  const scanConfig = useMemo<PatternConfig>(
+    () => ({
+      ...DEFAULT_CONFIG,
+      minScore: settings.minScore,
+      payout: settings.payout,
+      requireStrongC3: settings.requireStrongC3,
+      minWickRatio: settings.minWickRatio,
+    }),
+    [settings.minScore, settings.payout, settings.requireStrongC3, settings.minWickRatio],
+  );
+  const scanNow = Math.floor(now / 3000) * 3000;
+  const scanRows = useMemo(
+    () =>
+      rankRows(
+        relay.assets.map((a) =>
+          scanAsset(`QX:${a.asset}`, a.asset, a.label, relayCandles(a.asset), scanConfig, a.live, scanNow),
+        ),
+      ),
+    // relay.version changes whenever new candles arrive
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [relay.assets, relay.version, relayCandles, scanConfig, scanNow],
+  );
+  const scanRowsRef = useRef(scanRows);
+  useEffect(() => {
+    scanRowsRef.current = scanRows;
+  }, [scanRows]);
   const otcSymbols = allSymbols.filter((s) => s.provider === "quotex");
   const marketSymbols = allSymbols.filter((s) => s.provider !== "quotex");
 
@@ -325,6 +358,14 @@ export default function Dashboard() {
 
   // ---- polling loop, aligned to candle closes for slow feeds
   const fetchSignal = useCallback(async () => {
+    // scanner auto-follow: jump to the best actionable bridged pair
+    if (!demo && settings.autoFollow) {
+      const best = scanRowsRef.current[0];
+      if (best && best.actionable && best.id !== symbolId) {
+        setSymbolId(best.id);
+        return;
+      }
+    }
     // Quotex asset with data relayed into this browser: compute everything locally
     if (!demo && symbolId.startsWith("QX:")) {
       const asset = symbolId.slice(3);
@@ -399,6 +440,7 @@ export default function Dashboard() {
     settings.requireStrongC3,
     settings.minWickRatio,
     settings.mode,
+    settings.autoFollow,
     processResponse,
     demo,
     relayCandles,
@@ -580,6 +622,20 @@ export default function Dashboard() {
       )}
 
       <BridgeBar status={bridge} relay={relay} />
+
+      {relay.assets.length > 0 && (
+        <ScannerBoard
+          rows={scanRows}
+          selectedId={symbolId}
+          autoFollow={settings.autoFollow}
+          minScore={settings.minScore}
+          onSelect={(id) => {
+            setSettings({ ...settings, autoFollow: false });
+            setSymbolId(id);
+          }}
+          onToggleAutoFollow={() => setSettings({ ...settings, autoFollow: !settings.autoFollow })}
+        />
+      )}
 
       {data?.symbol.provider === "quotex" && data.candles.length < 40 && (
         <div className="card px-4 py-3 text-xs text-amber border-amber/40">
