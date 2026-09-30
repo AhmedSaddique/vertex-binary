@@ -130,4 +130,7 @@ export interface SignalResponse {
   sentiment: Sentiment;
   backtest: BacktestResult;
   config: PatternConfig;
+  /** Every-candle model: prediction for the candle that opens after the last closed one */
+  prediction: import("./predict").Prediction | null;
+  predictionBacktest: BacktestResult;
 }
