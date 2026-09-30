@@ -1,0 +1,850 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import CandleChart from "./CandleChart";
+import SignalDial, { DialMode } from "./SignalDial";
+import { outcomeOf } from "@/lib/backtest";
+import {
+  BacktestBucket,
+  DEFAULT_CONFIG,
+  Direction,
+  Outcome,
+  Signal,
+  SignalResponse,
+  SymbolInfo,
+} from "@/lib/types";
+
+interface LogEntry {
+  id: string;
+  symbol: string;
+  label: string;
+  direction: Direction;
+  entryTime: number;
+  expiryTime: number;
+  score: number;
+  strength: number;
+  outcome: Outcome | "PENDING";
+  c4Close?: number;
+}
+
+interface Settings {
+  minScore: number;
+  payout: number;
+  requireStrongC3: boolean;
+  minWickRatio: number;
+  sound: boolean;
+  telegram: boolean;
+  maxConsecutiveLosses: number;
+}
+
+const DEFAULT_SETTINGS: Settings = {
+  minScore: DEFAULT_CONFIG.minScore,
+  payout: DEFAULT_CONFIG.payout,
+  requireStrongC3: DEFAULT_CONFIG.requireStrongC3,
+  minWickRatio: DEFAULT_CONFIG.minWickRatio,
+  sound: true,
+  telegram: false,
+  maxConsecutiveLosses: 3,
+};
+
+const LS = {
+  symbol: "vb:symbol",
+  log: "vb:log",
+  settings: "vb:settings",
+  riskReset: "vb:riskReset",
+};
+
+function load<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? { ...fallback, ...(JSON.parse(raw) as T) } : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function loadRaw<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function save(key: string, value: unknown) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* ignore */
+  }
+}
+
+const fmtTime = (ms: number) =>
+  new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+const dirLabel = (d: Direction) => (d === "PUT" ? "SELL (DOWN)" : "BUY (UP)");
+
+export default function Dashboard() {
+  const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
+  const [symbolId, setSymbolId] = useState(() => loadRaw(LS.symbol, "BTCUSDT"));
+  const [settings, setSettings] = useState<Settings>(() => load(LS.settings, DEFAULT_SETTINGS));
+  const [log, setLog] = useState<LogEntry[]>(() => loadRaw<LogEntry[]>(LS.log, []));
+  const [riskReset, setRiskReset] = useState(() => loadRaw(LS.riskReset, 0));
+  const [data, setData] = useState<SignalResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [showSettings, setShowSettings] = useState(false);
+  const [demo, setDemo] = useState<Direction | null>(null);
+  const [audioReady, setAudioReady] = useState(false);
+  const audioCtx = useRef<AudioContext | null>(null);
+  const lastFetch = useRef(0);
+
+  // ---- persist to localStorage (component is rendered client-only)
+  useEffect(() => save(LS.symbol, symbolId), [symbolId]);
+  useEffect(() => save(LS.settings, settings), [settings]);
+  useEffect(() => save(LS.log, log.slice(-300)), [log]);
+  useEffect(() => save(LS.riskReset, riskReset), [riskReset]);
+
+  // ---- clock
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(t);
+  }, []);
+
+  // ---- symbols + Quotex bridge status (re-polled so OTC assets appear as the bridge sees them)
+  const [bridge, setBridge] = useState<BridgeStatus | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      fetch("/api/symbols")
+        .then((r) => r.json())
+        .then((j: { symbols: SymbolInfo[] }) => !cancelled && setSymbols(j.symbols))
+        .catch(() => undefined);
+      fetch("/api/quotex/status")
+        .then((r) => r.json())
+        .then((j: BridgeStatus) => !cancelled && setBridge(j))
+        .catch(() => undefined);
+    };
+    load();
+    const t = setInterval(load, 10_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  const symbol = useMemo(() => symbols.find((s) => s.id === symbolId), [symbols, symbolId]);
+  const otcSymbols = symbols.filter((s) => s.provider === "quotex");
+  const marketSymbols = symbols.filter((s) => s.provider !== "quotex");
+
+  // ---- risk manager: consecutive losses since last reset
+  const consecutiveLosses = useMemo(() => {
+    let n = 0;
+    for (let i = log.length - 1; i >= 0; i--) {
+      const e = log[i];
+      if (e.entryTime < riskReset) break;
+      if (e.outcome === "PENDING" || e.outcome === "TIE") continue;
+      if (e.outcome === "LOSS") n++;
+      else break;
+    }
+    return n;
+  }, [log, riskReset]);
+  const paused = consecutiveLosses >= settings.maxConsecutiveLosses;
+
+  // ---- sound
+  const beep = useCallback(
+    (direction: Direction) => {
+      if (!settings.sound || !audioCtx.current) return;
+      const ctx = audioCtx.current;
+      const base = direction === "CALL" ? 880 : 440;
+      [0, 0.18, 0.36].forEach((t, i) => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = "sine";
+        o.frequency.value = base * (i === 2 ? 1.5 : 1);
+        g.gain.setValueAtTime(0.0001, ctx.currentTime + t);
+        g.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime + t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.16);
+        o.connect(g).connect(ctx.destination);
+        o.start(ctx.currentTime + t);
+        o.stop(ctx.currentTime + t + 0.18);
+      });
+    },
+    [settings.sound],
+  );
+  const enableAudio = () => {
+    if (!audioCtx.current) {
+      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      audioCtx.current = new Ctor();
+    }
+    audioCtx.current.resume();
+    setAudioReady(true);
+  };
+
+  // ---- signal lifecycle: log new qualified signals, resolve pending ones
+  const alerted = useRef<Set<string>>(new Set());
+  const processResponse = useCallback(
+    (resp: SignalResponse, isDemo: boolean) => {
+      const sig = resp.signal;
+      const fresh = sig && sig.qualified && !paused && Date.now() < sig.expiryTime ? sig : null;
+      const id = fresh ? `${isDemo ? "demo" : resp.symbol.id}:${fresh.entryTime}` : null;
+
+      // side effects (sound, Telegram) exactly once per signal
+      if (fresh && id && !alerted.current.has(id)) {
+        alerted.current.add(id);
+        beep(fresh.direction);
+        if (settings.telegram && !isDemo) {
+          const text =
+            `<b>${dirLabel(fresh.direction)}</b> on <b>${resp.symbol.label}</b>\n` +
+            `Enter at open of next candle (${fmtTime(fresh.entryTime)}), expiry 1 min\n` +
+            `Score ${fresh.score}/10 · strength ${fresh.strength}/5 · ${fresh.sentiment.toLowerCase()} context`;
+          fetch("/api/notify", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ text }),
+          }).catch(() => undefined);
+        }
+      }
+
+      if (isDemo) return; // demo signals never enter the real log
+
+      setLog((prev) => {
+        let next = prev;
+        if (fresh && id && !prev.some((e) => e.id === id)) {
+          next = [
+            ...prev,
+            {
+              id,
+              symbol: resp.symbol.id,
+              label: resp.symbol.label,
+              direction: fresh.direction,
+              entryTime: fresh.entryTime,
+              expiryTime: fresh.expiryTime,
+              score: fresh.score,
+              strength: fresh.strength,
+              outcome: "PENDING",
+            },
+          ];
+        }
+        // resolve pending entries whose C4 has closed
+        const byTime = new Map(resp.candles.map((c) => [c.time, c]));
+        let changed = false;
+        const resolved = next.map((e) => {
+          if (e.outcome !== "PENDING" || e.symbol !== resp.symbol.id) return e;
+          const c4 = byTime.get(e.entryTime);
+          if (!c4) return e;
+          changed = true;
+          return { ...e, outcome: outcomeOf(e.direction, c4), c4Close: c4.close };
+        });
+        return changed ? resolved : next;
+      });
+    },
+    [paused, beep, settings.telegram],
+  );
+
+  // ---- polling loop, aligned to candle closes for slow feeds
+  const fetchSignal = useCallback(async () => {
+    const q = new URLSearchParams({
+      symbol: symbolId,
+      minScore: String(settings.minScore),
+      payout: String(settings.payout),
+      requireStrongC3: settings.requireStrongC3 ? "1" : "0",
+      minWickRatio: String(settings.minWickRatio),
+      ...(demo ? { mock: demo } : {}),
+    });
+    lastFetch.current = Date.now();
+    try {
+      const res = await fetch(`/api/signal?${q}`, { cache: "no-store" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+      const resp = json as SignalResponse;
+      setData(resp);
+      setError(null);
+      processResponse(resp, Boolean(demo));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Feed error");
+    }
+  }, [
+    symbolId,
+    settings.minScore,
+    settings.payout,
+    settings.requireStrongC3,
+    settings.minWickRatio,
+    processResponse,
+    demo,
+  ]);
+
+  // demo mode switches itself off after the demo candle has expired
+  useEffect(() => {
+    if (!demo) return;
+    const t = setTimeout(() => setDemo(null), 75_000);
+    return () => clearTimeout(t);
+  }, [demo]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const fast = !symbol || symbol.provider !== "twelvedata";
+
+    const loop = async () => {
+      await fetchSignal();
+      if (cancelled) return;
+      let delay: number;
+      if (fast) {
+        delay = 4000;
+      } else {
+        const t = Date.now();
+        const intoMinute = t % 60_000;
+        // right after a close, retry every 5s until the feed publishes the new candle
+        delay = intoMinute < 30_000 ? 5000 : 60_000 - intoMinute + 3000;
+      }
+      timer = setTimeout(loop, delay);
+    };
+    loop();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [fetchSignal, symbol]);
+
+  // ---- derived UI state
+  const sig: Signal | null = data?.signal ?? null;
+  const live = sig && now < sig.expiryTime ? sig : null;
+  const secToClose = 60 - Math.floor((now / 1000) % 60);
+
+  let mode: DialMode = "WAIT";
+  let headline = "SCANNING";
+  let sub = "Watching the last three closed candles for a liquidity sweep.";
+  let countdown = `next candle closes in ${secToClose}s`;
+
+  if (error && !data) {
+    mode = "OFFLINE";
+    headline = "FEED OFFLINE";
+    sub = error;
+    countdown = "";
+  } else if (paused) {
+    mode = "PAUSED";
+    headline = "SESSION PAUSED";
+    sub = `${consecutiveLosses} losses in a row. The document says stop here, no martingale. Reset when you are ready.`;
+  } else if (live && live.qualified) {
+    mode = live.direction;
+    headline = live.direction === "PUT" ? "SELL (SHORT)" : "BUY (LONG)";
+    const sinceEntry = now - live.entryTime;
+    if (sinceEntry < 0) {
+      sub = "C3 closed. Enter at the open of the next candle.";
+      countdown = `enter in ${Math.ceil(-sinceEntry / 1000)}s`;
+    } else if (sinceEntry < 20_000) {
+      sub = `ENTER NOW on ${data?.symbol.label}, 1-minute expiry. Entry window closes soon.`;
+      countdown = `entry window ${Math.ceil((20_000 - sinceEntry) / 1000)}s`;
+    } else {
+      sub = "Trade running. Result is graded when this candle closes.";
+      countdown = `expires in ${Math.ceil((live.expiryTime - now) / 1000)}s`;
+    }
+  } else if (live && !live.qualified) {
+    mode = "WEAK";
+    headline = "WEAK SETUP";
+    sub = `Pattern matched (${dirLabel(live.direction)}) but score ${live.score}/10 is below your minimum of ${settings.minScore}. Skipped.`;
+  }
+
+  const bt = data?.backtest;
+  const rateBucket: BacktestBucket | undefined = bt
+    ? bt.qualified.signals >= 10
+      ? bt.qualified
+      : bt.all
+    : undefined;
+  const aboveBreakEven = bt && rateBucket ? rateBucket.winRate > bt.breakEven : false;
+
+  const sessionLog = log.filter((e) => e.entryTime >= riskReset);
+  const liveWins = sessionLog.filter((e) => e.outcome === "WIN").length;
+  const liveLosses = sessionLog.filter((e) => e.outcome === "LOSS").length;
+  const scoreShown = live?.score;
+
+  const sentiment = data?.sentiment ?? "RANGING";
+
+  return (
+    <div className="mx-auto w-full max-w-6xl px-4 py-5 flex flex-col gap-5">
+      {/* header */}
+      <header className="flex flex-wrap items-center gap-3 justify-between">
+        <div className="flex items-center gap-3">
+          <div className="h-9 w-9 rounded-lg bg-gradient-to-br from-up to-cyan flex items-center justify-center font-black text-black">
+            V
+          </div>
+          <div>
+            <div className="font-black tracking-widest text-lg leading-none">VERTEX BINARY</div>
+            <div className="text-[11px] text-muted tracking-wider">WICK LIQUIDITY SWEEP · 1M REVERSAL SCANNER</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <select
+            className="bg-panel border border-line rounded-lg px-3 py-2 text-sm"
+            value={symbolId}
+            onChange={(e) => setSymbolId(e.target.value)}
+          >
+            <optgroup label={otcSymbols.length ? "Quotex OTC (bridge)" : "Quotex OTC (bridge not connected)"}>
+              {otcSymbols.map((s) => (
+                <option key={s.id} value={s.id} disabled={!s.available}>
+                  {s.label}
+                  {s.available ? "" : " (stale)"}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="Real market">
+              {marketSymbols.map((s) => (
+                <option key={s.id} value={s.id} disabled={!s.available}>
+                  {s.label}
+                  {s.available ? "" : " (needs key)"}
+                </option>
+              ))}
+            </optgroup>
+          </select>
+          <span
+            className={`h-2.5 w-2.5 rounded-full ${error ? "bg-down" : data ? "bg-up" : "bg-amber"}`}
+            title={error ?? (data ? "connected" : "connecting")}
+          />
+          <span className="mono text-sm text-muted">{fmtTime(now)}</span>
+          {!audioReady && (
+            <button onClick={enableAudio} className="text-xs border border-line rounded-lg px-2 py-1.5 hover:bg-panel-2">
+              Enable sound
+            </button>
+          )}
+          <button
+            onClick={() => setDemo((d) => (d === null ? "PUT" : d === "PUT" ? "CALL" : null))}
+            className={`text-xs border rounded-lg px-2 py-1.5 hover:bg-panel-2 ${demo ? "border-amber text-amber" : "border-line"}`}
+            title="Show a synthetic example signal (never logged)"
+          >
+            {demo === "PUT" ? "Demo: SELL → next" : demo === "CALL" ? "Demo: BUY → exit" : "Demo"}
+          </button>
+          <button
+            onClick={() => setShowSettings((v) => !v)}
+            className="text-xs border border-line rounded-lg px-2 py-1.5 hover:bg-panel-2"
+          >
+            Settings
+          </button>
+          <a
+            href="https://market-qx.trade/en/trade"
+            target="_blank"
+            rel="noreferrer"
+            className="text-xs rounded-lg px-3 py-1.5 bg-up text-black font-bold"
+          >
+            Open Quotex
+          </a>
+        </div>
+      </header>
+
+      {showSettings && (
+        <SettingsPanel settings={settings} onChange={setSettings} onClose={() => setShowSettings(false)} />
+      )}
+
+      <BridgeBar status={bridge} />
+
+      {data?.symbol.provider === "quotex" && data.candles.length < 40 && (
+        <div className="card px-4 py-3 text-xs text-amber border-amber/40">
+          Only {data.candles.length} closed candles collected for {data.symbol.label} so far. The scanner
+          needs about 40 to score signals properly and far more for a meaningful backtest. Keep the
+          Quotex tab open on this chart.
+        </div>
+      )}
+
+      {/* main signal card */}
+      <section className="card p-6 sm:p-8 grid gap-8 lg:grid-cols-[1fr_1.2fr] items-center relative">
+        {demo && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 text-[11px] tracking-widest text-amber border border-amber/50 rounded-full px-3 py-1 bg-black/60">
+            DEMO DATA · synthetic candles, not the market
+          </div>
+        )}
+        <div className="flex flex-col items-center gap-3">
+          <div className="text-xs tracking-[0.35em] text-muted">SIGNAL FOR</div>
+          <div className="text-2xl sm:text-3xl font-black text-up glow-green text-center">
+            {data?.symbol.label ?? symbol?.label ?? symbolId}
+          </div>
+          <div className="text-xs tracking-widest text-cyan">TIMEFRAME: 1M · EXPIRY: 1 MIN</div>
+          <div className="mt-2">
+            <SignalDial mode={mode} headline={headline} sub={sub} countdown={countdown} />
+          </div>
+          {paused && (
+            <button
+              onClick={() => setRiskReset(Date.now())}
+              className="mt-2 text-xs border border-amber text-amber rounded-lg px-3 py-1.5"
+            >
+              Reset risk stop
+            </button>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <Stat title="SIGNAL STRENGTH">
+            <div className="flex gap-1.5 mb-1">
+              {[1, 2, 3, 4, 5].map((n) => (
+                <span
+                  key={n}
+                  className={`h-3 w-3 rounded-full ${
+                    live && n <= live.strength
+                      ? live.direction === "PUT"
+                        ? "bg-down shadow-[0_0_8px_var(--red)]"
+                        : "bg-up shadow-[0_0_8px_var(--green)]"
+                      : "bg-line"
+                  }`}
+                />
+              ))}
+            </div>
+            <div className="text-2xl font-black">{live ? `${live.strength}/5` : "–/5"}</div>
+          </Stat>
+
+          <Stat title="WIN RATE" badge={bt ? `${rateBucket?.signals ?? 0} signals` : undefined}>
+            <div className={`text-3xl font-black ${aboveBreakEven ? "text-up glow-green" : "text-amber"}`}>
+              {rateBucket && rateBucket.signals > 0 ? pct(rateBucket.winRate) : "–"}
+            </div>
+            <div className="text-[11px] text-muted">
+              backtest on last {bt?.candles ?? 0} candles · break-even {bt ? pct(bt.breakEven) : "–"}
+            </div>
+            <div className="text-[11px] mt-1">
+              <span className="text-up">● LIVE</span> {liveWins}W / {liveLosses}L
+              {liveWins + liveLosses > 0 && ` (${pct(liveWins / (liveWins + liveLosses))})`}
+            </div>
+          </Stat>
+
+          <Stat title="CONFIDENCE SCORE">
+            <div className="text-3xl font-black">
+              {scoreShown !== undefined ? scoreShown.toFixed(1) : "–"}
+              <span className="text-base text-muted">/10</span>
+            </div>
+            <div className="text-[11px] text-muted">minimum to trade: {settings.minScore}</div>
+          </Stat>
+
+          <Stat title="MARKET SENTIMENT">
+            <div
+              className={`text-2xl font-black ${
+                sentiment === "BULLISH" ? "text-up glow-green" : sentiment === "BEARISH" ? "text-down glow-red" : "text-cyan"
+              }`}
+            >
+              {sentiment}
+            </div>
+            <div className="text-[11px] text-muted">
+              {live
+                ? `liquidity ${live.direction === "PUT" ? "above" : "below"} swept ✓`
+                : "30-candle regression context"}
+            </div>
+          </Stat>
+
+          <div className="col-span-2 card px-4 py-3 flex items-center gap-3">
+            <span className="text-[11px] tracking-widest text-up">● SCANNER RUNNING</span>
+            <div className="flex items-end gap-[3px] h-5">
+              {Array.from({ length: 28 }).map((_, i) => (
+                <span
+                  key={i}
+                  className="eq-bar w-[3px] h-full rounded bg-up/70"
+                  style={{ animationDelay: `${(i % 7) * 0.12}s` }}
+                />
+              ))}
+            </div>
+            <span className="ml-auto text-[11px] text-muted mono">
+              {data ? `updated ${fmtTime(data.serverTime)}` : "connecting…"}
+            </span>
+          </div>
+        </div>
+      </section>
+
+      {/* chart + checklist */}
+      <section className="grid gap-5 lg:grid-cols-[1.4fr_1fr]">
+        <div className="card p-4">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs tracking-widest text-muted">LAST 40 CANDLES · 1M</div>
+            <div className="text-[11px] text-muted">
+              {data?.symbol.provider === "binance"
+                ? "Binance feed"
+                : data?.symbol.provider === "quotex"
+                  ? "Quotex bridge feed"
+                  : "Twelve Data feed"}
+            </div>
+          </div>
+          <CandleChart candles={data?.candles ?? []} forming={data?.forming ?? null} signal={live} />
+          {data?.symbol.note && <div className="text-[11px] text-muted mt-2">{data.symbol.note}</div>}
+        </div>
+
+        <div className="card p-4">
+          <div className="text-xs tracking-widest text-muted mb-3">SETUP CHECKLIST</div>
+          {live ? (
+            <ul className="flex flex-col gap-2">
+              <Check ok label="Three same-colour candles" detail={live.direction === "PUT" ? "green → trade DOWN" : "red → trade UP"} />
+              <Check ok label="C1 & C2 wicks on the far side" detail={live.checks[0].detail} />
+              <Check ok label="C3 swept the wick tips and closed" detail={live.checks[2].detail} />
+              {live.checks.slice(1).map((c) =>
+                c.id === "sweep" ? null : (
+                  <Check key={c.id} ok={c.pass} label={c.label} detail={`${c.detail} · ${c.points.toFixed(1)}/${c.max}`} />
+                ),
+              )}
+              <li className="mt-2 text-xs text-muted border-t border-line pt-2">
+                Risk 1–2% per trade · stop after {settings.maxConsecutiveLosses} losses · no martingale.
+              </li>
+            </ul>
+          ) : (
+            <div className="text-sm text-muted leading-relaxed">
+              <p>A signal fires only when the exact rules from your document are met on closed candles:</p>
+              <ol className="list-decimal ml-5 mt-2 space-y-1">
+                <li>C1, C2, C3 all the same colour, none a doji.</li>
+                <li>C1 and C2 have a far-side wick of at least {Math.round(settings.minWickRatio * 100)}% of range.</li>
+                <li>C2&apos;s extreme is equal to or beyond C1&apos;s.</li>
+                <li>C3 pushes beyond both wick tips{settings.requireStrongC3 ? " with a body above the 10-candle average" : ""}.</li>
+                <li>Enter at the open of C4 in the opposite direction, 1-minute expiry.</li>
+              </ol>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* backtest + log */}
+      <section className="grid gap-5 lg:grid-cols-2">
+        <div className="card p-4">
+          <div className="text-xs tracking-widest text-muted mb-3">BACKTEST ON LOADED HISTORY</div>
+          {bt ? (
+            <div className="text-sm">
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <BucketBox b={bt.all} be={bt.breakEven} />
+                <BucketBox b={bt.qualified} be={bt.breakEven} />
+              </div>
+              <div className="text-[11px] text-muted mb-1">By strength</div>
+              <div className="grid grid-cols-5 gap-1 mb-3">
+                {bt.byStrength.map((b) => (
+                  <div key={b.label} className="rounded-lg bg-panel border border-line p-2 text-center">
+                    <div className="text-[10px] text-muted">{b.label}</div>
+                    <div className={`font-bold ${b.signals && b.winRate > bt.breakEven ? "text-up" : ""}`}>
+                      {b.signals ? pct(b.winRate) : "–"}
+                    </div>
+                    <div className="text-[10px] text-muted">{b.signals}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="text-[11px] text-muted mb-1">By session (UTC)</div>
+              <div className="flex flex-wrap gap-1">
+                {bt.bySession.map((b) => (
+                  <div key={b.label} className="rounded-lg bg-panel border border-line px-2 py-1 text-xs">
+                    {b.label}: <b className={b.winRate > bt.breakEven ? "text-up" : ""}>{pct(b.winRate)}</b>{" "}
+                    <span className="text-muted">({b.signals})</span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-muted mt-3">
+                The document asks for 200+ signals before trusting a number. Load history from more days
+                or more pairs before drawing conclusions. Ties are excluded from the win rate.
+              </p>
+            </div>
+          ) : (
+            <div className="text-sm text-muted">Waiting for data…</div>
+          )}
+        </div>
+
+        <div className="card p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-xs tracking-widest text-muted">SIGNAL LOG</div>
+            <button
+              onClick={() => {
+                setLog([]);
+                setRiskReset(0);
+              }}
+              className="text-[11px] text-muted hover:text-text"
+            >
+              clear
+            </button>
+          </div>
+          {log.length === 0 ? (
+            <div className="text-sm text-muted">No signals fired yet in this browser.</div>
+          ) : (
+            <div className="max-h-72 overflow-auto">
+              <table className="w-full text-xs">
+                <thead className="text-muted text-left">
+                  <tr>
+                    <th className="py-1">Entry</th>
+                    <th>Pair</th>
+                    <th>Dir</th>
+                    <th>Score</th>
+                    <th>Result</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...log].reverse().map((e) => (
+                    <tr key={e.id} className="border-t border-line">
+                      <td className="py-1.5 mono">{fmtTime(e.entryTime)}</td>
+                      <td>{e.label}</td>
+                      <td className={e.direction === "PUT" ? "text-down" : "text-up"}>
+                        {e.direction === "PUT" ? "DOWN" : "UP"}
+                      </td>
+                      <td>{e.score.toFixed(1)}</td>
+                      <td
+                        className={
+                          e.outcome === "WIN"
+                            ? "text-up font-bold"
+                            : e.outcome === "LOSS"
+                              ? "text-down font-bold"
+                              : "text-muted"
+                        }
+                      >
+                        {e.outcome}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <footer className="text-[11px] text-muted leading-relaxed pb-6">
+        Educational tool. Signals are generated mechanically from the Wick Liquidity Sweep Reversal rules
+        and graded on the following candle. Past win rates do not guarantee future results. Binary options
+        can lose your whole stake. Quotex has no official API, so this scanner reads a real-market data feed
+        and you place trades yourself; OTC prices on Quotex are synthetic and can differ from any feed.
+      </footer>
+    </div>
+  );
+}
+
+interface BridgeStatus {
+  connected: boolean;
+  lastIngest: number;
+  page: string;
+  messages: number;
+  parsedMessages: number;
+  assets: { asset: string; label: string; candles: number; live: boolean; lastPrice: number }[];
+  unparsedSamples: { at: number; text: string }[];
+}
+
+function BridgeBar({ status }: { status: BridgeStatus | null }) {
+  const [open, setOpen] = useState(false);
+  const connected = Boolean(status?.connected);
+  const liveAssets = status?.assets.filter((a) => a.live) ?? [];
+  const receivingButUnparsed = connected && (status?.messages ?? 0) > 50 && (status?.parsedMessages ?? 0) === 0;
+  return (
+    <div className={`card px-4 py-3 text-xs ${connected ? "border-up/40" : ""}`}>
+      <div className="flex flex-wrap items-center gap-3">
+        <span className={`h-2 w-2 rounded-full ${connected ? "bg-up shadow-[0_0_8px_var(--green)]" : "bg-line"}`} />
+        <span className="tracking-widest text-muted">QUOTEX OTC BRIDGE</span>
+        {connected ? (
+          <span>
+            connected · {liveAssets.length} live asset{liveAssets.length === 1 ? "" : "s"} ·{" "}
+            {status?.parsedMessages ?? 0} parsed / {status?.messages ?? 0} messages
+          </span>
+        ) : (
+          <span className="text-muted">
+            not connected. Install the bridge script, then open a chart in Quotex in the same browser.
+          </span>
+        )}
+        <a href="/quotex-bridge.user.js" className="ml-auto underline text-cyan" target="_blank" rel="noreferrer">
+          Install bridge script
+        </a>
+        <button onClick={() => setOpen((v) => !v)} className="text-muted hover:text-text">
+          {open ? "hide" : "how it works"}
+        </button>
+      </div>
+      {receivingButUnparsed && (
+        <div className="mt-2 text-amber">
+          Messages are arriving but no ticks were recognised yet. Open a chart in Quotex; if this persists,
+          share the samples from <a className="underline" href="/api/quotex/status" target="_blank" rel="noreferrer">/api/quotex/status</a> so the parser can be adjusted.
+        </div>
+      )}
+      {open && (
+        <ol className="mt-3 list-decimal ml-5 space-y-1 text-muted leading-relaxed">
+          <li>Install the Tampermonkey extension in Chrome or Edge.</li>
+          <li>Click <b>Install bridge script</b> above and confirm in Tampermonkey.</li>
+          <li>Log in to Quotex yourself in that browser and open the OTC chart you want to trade. A small
+            green “Vertex bridge” badge appears bottom‑right on the Quotex page.</li>
+          <li>The asset appears in the pair list here under <b>Quotex OTC</b> within a few seconds.
+            Each chart you open in Quotex is added.</li>
+          <li>The script is read‑only: it copies chart messages your browser already receives to this app
+            on your PC and never sends anything to Quotex or reads your login.</li>
+        </ol>
+      )}
+    </div>
+  );
+}
+
+function Stat({ title, badge, children }: { title: string; badge?: string; children: React.ReactNode }) {
+  return (
+    <div className="card p-4">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[10px] tracking-[0.25em] text-muted">{title}</div>
+        {badge && <div className="text-[10px] text-muted">{badge}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Check({ ok, label, detail }: { ok: boolean; label: string; detail: string }) {
+  return (
+    <li className="flex gap-2 text-sm">
+      <span className={`mt-0.5 h-4 w-4 shrink-0 rounded-full text-[10px] flex items-center justify-center font-bold ${ok ? "bg-up text-black" : "bg-line text-muted"}`}>
+        {ok ? "✓" : "–"}
+      </span>
+      <div>
+        <div>{label}</div>
+        <div className="text-[11px] text-muted">{detail}</div>
+      </div>
+    </li>
+  );
+}
+
+function BucketBox({ b, be }: { b: BacktestBucket; be: number }) {
+  const good = b.signals > 0 && b.winRate > be;
+  return (
+    <div className="rounded-lg bg-panel border border-line p-3">
+      <div className="text-[11px] text-muted">{b.label}</div>
+      <div className={`text-2xl font-black ${good ? "text-up" : b.signals ? "text-amber" : ""}`}>
+        {b.signals ? pct(b.winRate) : "–"}
+      </div>
+      <div className="text-[11px] text-muted">
+        {b.wins}W / {b.losses}L / {b.ties}T · {b.signals} signals
+      </div>
+    </div>
+  );
+}
+
+function SettingsPanel({
+  settings,
+  onChange,
+  onClose,
+}: {
+  settings: Settings;
+  onChange: (s: Settings) => void;
+  onClose: () => void;
+}) {
+  const set = <K extends keyof Settings>(k: K, v: Settings[K]) => onChange({ ...settings, [k]: v });
+  return (
+    <div className="card p-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 text-sm">
+      <label className="flex flex-col gap-1">
+        <span className="text-muted text-xs">Minimum confidence score: {settings.minScore}</span>
+        <input type="range" min={0} max={10} step={0.5} value={settings.minScore} onChange={(e) => set("minScore", Number(e.target.value))} />
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-muted text-xs">Payout for break-even: {Math.round(settings.payout * 100)}%</span>
+        <input type="range" min={0.5} max={1} step={0.01} value={settings.payout} onChange={(e) => set("payout", Number(e.target.value))} />
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-muted text-xs">Min wick size (C1, C2): {Math.round(settings.minWickRatio * 100)}% of range</span>
+        <input type="range" min={0.1} max={0.5} step={0.05} value={settings.minWickRatio} onChange={(e) => set("minWickRatio", Number(e.target.value))} />
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-muted text-xs">Stop after consecutive losses: {settings.maxConsecutiveLosses}</span>
+        <input type="range" min={1} max={10} step={1} value={settings.maxConsecutiveLosses} onChange={(e) => set("maxConsecutiveLosses", Number(e.target.value))} />
+      </label>
+      <label className="flex items-center gap-2">
+        <input type="checkbox" checked={settings.requireStrongC3} onChange={(e) => set("requireStrongC3", e.target.checked)} />
+        Require strong C3 (body above 10-candle average)
+      </label>
+      <label className="flex items-center gap-2">
+        <input type="checkbox" checked={settings.sound} onChange={(e) => set("sound", e.target.checked)} />
+        Sound alert on signal
+      </label>
+      <label className="flex items-center gap-2">
+        <input type="checkbox" checked={settings.telegram} onChange={(e) => set("telegram", e.target.checked)} />
+        Telegram alert (needs env vars)
+      </label>
+      <div className="sm:col-span-2 lg:col-span-3 flex justify-end">
+        <button onClick={onClose} className="text-xs border border-line rounded-lg px-3 py-1.5">
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
