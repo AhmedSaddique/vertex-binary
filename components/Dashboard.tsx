@@ -701,6 +701,7 @@ export default function Dashboard() {
 }
 
 interface BridgeStatus {
+  backend: "redis" | "memory";
   connected: boolean;
   lastIngest: number;
   page: string;
@@ -720,6 +721,18 @@ function BridgeBar({ status }: { status: BridgeStatus | null }) {
       <div className="flex flex-wrap items-center gap-3">
         <span className={`h-2 w-2 rounded-full ${connected ? "bg-up shadow-[0_0_8px_var(--green)]" : "bg-line"}`} />
         <span className="tracking-widest text-muted">QUOTEX OTC BRIDGE</span>
+        {status && (
+          <span
+            className={`rounded-full border px-2 py-0.5 text-[10px] ${status.backend === "redis" ? "border-up/50 text-up" : "border-line text-muted"}`}
+            title={
+              status.backend === "redis"
+                ? "Shared storage active: works on Vercel"
+                : "In-memory storage: fine locally, but on Vercel add Upstash Redis or the bridge data is lost between requests"
+            }
+          >
+            {status.backend === "redis" ? "storage: redis" : "storage: memory"}
+          </span>
+        )}
         {connected ? (
           <span>
             connected · {liveAssets.length} live asset{liveAssets.length === 1 ? "" : "s"} ·{" "}

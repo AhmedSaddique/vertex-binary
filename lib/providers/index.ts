@@ -29,7 +29,7 @@ const DEFS: SymbolDef[] = [
 const QUOTEX_NOTE =
   "Quotex chart stream forwarded by the bridge userscript in your own browser. History starts when the bridge connects.";
 
-export function listSymbols(): SymbolInfo[] {
+export async function listSymbols(): Promise<SymbolInfo[]> {
   const hasTD = Boolean(process.env.TWELVEDATA_API_KEY);
   const fixed: SymbolInfo[] = DEFS.map((d) => ({
     ...d,
@@ -41,7 +41,7 @@ export function listSymbols(): SymbolInfo[] {
           : "Add TWELVEDATA_API_KEY to .env.local to enable forex pairs."
         : "Free Binance feed, no key needed.",
   }));
-  const bridged: SymbolInfo[] = bridgeAssets().map((a) => ({
+  const bridged: SymbolInfo[] = (await bridgeAssets()).map((a) => ({
     id: `QX:${a.asset}`,
     label: a.label,
     provider: "quotex",
@@ -54,10 +54,10 @@ export function listSymbols(): SymbolInfo[] {
   return [...bridged, ...fixed];
 }
 
-export function getSymbol(id: string): SymbolInfo | undefined {
+export async function getSymbol(id: string): Promise<SymbolInfo | undefined> {
   if (id.startsWith("QX:")) {
     const asset = id.slice(3);
-    const a = bridgeAssets().find((x) => x.asset === asset);
+    const a = (await bridgeAssets()).find((x) => x.asset === asset);
     return {
       id,
       label: a?.label ?? labelFor(asset),
@@ -69,7 +69,7 @@ export function getSymbol(id: string): SymbolInfo | undefined {
       note: a ? QUOTEX_NOTE : "This Quotex asset has not been seen by the bridge yet. Open its chart in Quotex.",
     };
   }
-  return listSymbols().find((s) => s.id === id.toUpperCase());
+  return (await listSymbols()).find((s) => s.id === id.toUpperCase());
 }
 
 interface CacheEntry {
@@ -98,7 +98,7 @@ async function fetchRaw(sym: SymbolInfo, limit: number): Promise<Candle[]> {
  * small, frequently refreshed tail, so polling stays cheap on provider limits.
  */
 export async function fetchCandles(sym: SymbolInfo, limit = 3000): Promise<Candle[]> {
-  if (sym.provider === "quotex") return quotexCandles(sym.query).slice(-limit);
+  if (sym.provider === "quotex") return (await quotexCandles(sym.query)).slice(-limit);
   const tailTtl = sym.provider === "binance" ? 2_000 : 15_000;
   const tail = await cached(`${sym.id}:tail`, tailTtl, () => fetchRaw(sym, 200));
   if (limit <= 200) return tail.slice(-limit);

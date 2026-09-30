@@ -17,8 +17,8 @@ export async function POST(request: Request) {
   try {
     const body = (await request.json()) as { messages?: unknown[]; page?: string };
     const messages = Array.isArray(body.messages) ? body.messages.slice(0, 2000) : [];
-    ingest(messages, typeof body.page === "string" ? body.page : "");
-    return Response.json({ ok: true, received: messages.length }, { headers: CORS });
+    const result = await ingest(messages, typeof body.page === "string" ? body.page : "");
+    return Response.json({ ok: true, received: messages.length, ...result }, { headers: CORS });
   } catch {
     return Response.json({ ok: false }, { status: 400, headers: CORS });
   }

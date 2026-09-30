@@ -28,7 +28,7 @@ function configFrom(params: URLSearchParams): PatternConfig {
 
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
-  const symbol = getSymbol(params.get("symbol") ?? "BTCUSDT");
+  const symbol = await getSymbol(params.get("symbol") ?? "BTCUSDT");
   if (!symbol) return Response.json({ error: "Unknown symbol" }, { status: 400 });
   if (!symbol.available) {
     return Response.json({ error: symbol.note ?? "Symbol unavailable" }, { status: 503 });

@@ -7,10 +7,13 @@ import type { NextRequest } from "next/server";
  */
 export async function GET(request: NextRequest) {
   const origin = request.nextUrl.origin;
+  const host = request.nextUrl.hostname;
   const script = `// ==UserScript==
 // @name         Vertex Binary - Quotex bridge
 // @namespace    vertex-binary
-// @version      1.0.0
+// @version      1.1.0
+// @downloadURL  ${origin}/quotex-bridge.user.js
+// @updateURL    ${origin}/quotex-bridge.user.js
 // @description  Forwards the Quotex chart stream (read-only) from your own browser to the local Vertex Binary scanner.
 // @match        https://market-qx.trade/*
 // @match        https://*.market-qx.trade/*
@@ -23,6 +26,7 @@ export async function GET(request: NextRequest) {
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      ${host}
 // @connect      localhost
 // @connect      127.0.0.1
 // ==/UserScript==
