@@ -30,11 +30,7 @@ export function outcomeOf(direction: "CALL" | "PUT", c4: Candle): Outcome {
   return (direction === "CALL") === up ? "WIN" : "LOSS";
 }
 
-/**
- * Walk the history, fire the pattern on every candle, and grade the trade on
- * the following candle (C4) with a 1-minute expiry, exactly as the document
- * describes. Every closed signal in the window is included.
- */
+
 export function backtest(
   candles: Candle[],
   cfg: PatternConfig = DEFAULT_CONFIG,
