@@ -7,6 +7,7 @@ import {
   DEFAULT_CONFIG,
   Outcome,
   PatternConfig,
+  StrategyId,
 } from "./types";
 
 function bucket(label: string, trades: BacktestTrade[]): BacktestBucket {
@@ -31,6 +32,41 @@ export function outcomeOf(direction: "CALL" | "PUT", c4: Candle): Outcome {
 }
 
 
+/** Bucket graded trades into the result shape every engine reports. */
+export function summarize(
+  candles: Candle[],
+  cfg: PatternConfig,
+  trades: BacktestTrade[],
+  labels: { all: string; qualified: string } = { all: "All signals", qualified: `Score >= ${cfg.minScore}` },
+  strategies?: Partial<Record<StrategyId, string>>,
+): BacktestResult {
+  const byStrength = [1, 2, 3, 4, 5].map((s) =>
+    bucket(`${s}/5`, trades.filter((t) => t.strength === s)),
+  );
+  const sessionNames = Array.from(new Set(trades.map((t) => sessionOf(t.entryTime).name)));
+  const bySession = sessionNames.map((n) =>
+    bucket(n, trades.filter((t) => sessionOf(t.entryTime).name === n)),
+  );
+  const byStrategy = strategies
+    ? (Object.entries(strategies) as [StrategyId, string][]).map(([id, name]) =>
+        bucket(name, trades.filter((t) => t.strategy === id)),
+      )
+    : undefined;
+
+  return {
+    candles: candles.length,
+    from: candles[0]?.time ?? 0,
+    to: candles[candles.length - 1]?.time ?? 0,
+    breakEven: 1 / (1 + cfg.payout),
+    all: bucket(labels.all, trades),
+    qualified: bucket(labels.qualified, trades.filter((t) => t.qualified)),
+    byStrength,
+    bySession,
+    byStrategy,
+    trades: trades.slice(-100),
+  };
+}
+
 export function backtest(
   candles: Candle[],
   cfg: PatternConfig = DEFAULT_CONFIG,
@@ -50,26 +86,8 @@ export function backtest(
       qualified: sig.qualified,
       outcome: outcomeOf(sig.direction, c4),
       c4,
+      strategy: "wick",
     });
   }
-
-  const byStrength = [1, 2, 3, 4, 5].map((s) =>
-    bucket(`${s}/5`, trades.filter((t) => t.strength === s)),
-  );
-  const sessionNames = Array.from(new Set(trades.map((t) => sessionOf(t.entryTime).name)));
-  const bySession = sessionNames.map((n) =>
-    bucket(n, trades.filter((t) => sessionOf(t.entryTime).name === n)),
-  );
-
-  return {
-    candles: candles.length,
-    from: candles[0]?.time ?? 0,
-    to: candles[candles.length - 1]?.time ?? 0,
-    breakEven: 1 / (1 + cfg.payout),
-    all: bucket("All signals", trades),
-    qualified: bucket(`Score >= ${cfg.minScore}`, trades.filter((t) => t.qualified)),
-    byStrength,
-    bySession,
-    trades: trades.slice(-100),
-  };
+  return summarize(candles, cfg, trades);
 }

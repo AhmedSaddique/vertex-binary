@@ -62,7 +62,7 @@ interface Indicators {
 
 const DECAY = 0.993; // effective memory ~140 candles
 
-function ema(values: number[], period: number): number[] {
+export function ema(values: number[], period: number): number[] {
   const k = 2 / (period + 1);
   const out: number[] = [];
   let prev = values[0] ?? 0;
@@ -286,11 +286,12 @@ const STRENGTH_LABELS = ["<55%", "55-60%", "60-65%", "65-70%", "≥70%"];
 /**
  * Walk the closed candles, grade every prediction on the following candle, and
  * return the prediction for the candle that opens after the last closed one.
+ * `calls` holds every walk-forward call (not just the last 100), keyed by entry time.
  */
 export function predictNext(
   candles: Candle[],
   cfg: PatternConfig = DEFAULT_CONFIG,
-): { prediction: Prediction | null; backtest: BacktestResult } {
+): { prediction: Prediction | null; backtest: BacktestResult; calls: BacktestTrade[] } {
   const n = candles.length;
   const ind = n > 0 ? indicators(candles) : null;
   const counters: Counter[] = VOTERS.map(() => ({ hit: 0, n: 0 }));
@@ -388,5 +389,5 @@ export function predictNext(
     ),
     trades: trades.slice(-100),
   };
-  return { prediction, backtest };
+  return { prediction, backtest, calls: trades };
 }

@@ -10,6 +10,15 @@ export interface Candle {
 
 export type Direction = "CALL" | "PUT"; // CALL = UP / BUY, PUT = DOWN / SELL
 
+/** Rule-based setups: wick liquidity sweep and the three support / resistance setups */
+export type StrategyId = "wick" | "snr1" | "snr2" | "snr3";
+
+/**
+ * Dashboard modes. best = A+ confluence trades only, setups = SnR setups 1-3,
+ * pattern = wick liquidity sweep only, every = model call on every candle.
+ */
+export type Mode = "best" | "setups" | "pattern" | "every";
+
 export interface Check {
   id: string;
   label: string;
@@ -43,6 +52,18 @@ export interface Signal {
   sentiment: Sentiment;
   /** Whether the signal clears the configured minimum score */
   qualified: boolean;
+  /** Which rule-based setup produced the signal (absent on model calls) */
+  strategy?: StrategyId;
+  /** Human name of the setup, e.g. "Setup 3 · Breakout + retest" */
+  setupLabel?: string;
+  /** Caption for the dashed level line on the chart */
+  levelLabel?: string;
+  /** Candles to highlight on the chart */
+  marks?: { time: number; label: string }[];
+  /** Trendline to draw on the chart (Setup 2) */
+  trendline?: { t1: number; p1: number; t2: number; p2: number };
+  /** Best-of-best gates (only on A+ candidates) */
+  gates?: Check[];
 }
 
 export type Sentiment = "BULLISH" | "BEARISH" | "RANGING";
@@ -83,6 +104,7 @@ export interface BacktestTrade {
   qualified: boolean;
   outcome: Outcome;
   c4: Candle;
+  strategy?: StrategyId;
 }
 
 export interface BacktestBucket {
@@ -103,6 +125,8 @@ export interface BacktestResult {
   qualified: BacktestBucket;
   byStrength: BacktestBucket[];
   bySession: BacktestBucket[];
+  /** Per-setup breakdown, for engines that combine several setups */
+  byStrategy?: BacktestBucket[];
   trades: BacktestTrade[];
 }
 
@@ -125,10 +149,16 @@ export interface SignalResponse {
   candles: Candle[];
   /** Currently forming candle, if the feed provides it */
   forming: Candle | null;
-  /** Signal computed on the last three closed candles (may be unqualified) */
+  /** Wick sweep signal computed on the last three closed candles (may be unqualified) */
   signal: Signal | null;
   sentiment: Sentiment;
   backtest: BacktestResult;
+  /** Best SnR setup (1-3) on the last closed candle (may be unqualified) */
+  setup: Signal | null;
+  setupBacktest: BacktestResult;
+  /** Best-of-best candidate on the last closed candle; qualified = A+ */
+  best: Signal | null;
+  bestBacktest: BacktestResult;
   config: PatternConfig;
   /** Every-candle model: prediction for the candle that opens after the last closed one */
   prediction: import("./predict").Prediction | null;

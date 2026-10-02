@@ -320,5 +320,13 @@ export function detectSignal(
     checks,
     sentiment,
     qualified: score >= cfg.minScore,
+    strategy: "wick",
+    setupLabel: "Wick liquidity sweep",
+    levelLabel: "liquidity",
+    marks: [
+      { time: c1.time, label: "C1" },
+      { time: c2.time, label: "C2" },
+      { time: c3.time, label: "C3" },
+    ],
   };
 }

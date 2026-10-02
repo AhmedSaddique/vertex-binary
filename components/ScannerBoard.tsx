@@ -1,22 +1,28 @@
 "use client";
 
 import { ScanRow } from "@/lib/scan";
+import { BacktestBucket, Mode, Signal } from "@/lib/types";
 
 interface Props {
   rows: ScanRow[];
   selectedId: string;
   autoFollow: boolean;
   minScore: number;
+  mode: Mode;
   onSelect: (id: string) => void;
   onToggleAutoFollow: () => void;
 }
 
 const pct = (x: number) => `${Math.round(x * 100)}%`;
+const side = (s: Signal) => (s.direction === "PUT" ? "SELL" : "BUY");
+const SHORT: Record<string, string> = { wick: "Wick", snr1: "S1 SnR", snr2: "S2 Trendline", snr3: "S3 Retest" };
 
 function gradeClass(g: ScanRow["grade"]) {
   switch (g) {
+    case "A+":
+      return "bg-up text-black shadow-[0_0_8px_var(--green)]";
     case "A":
-      return "bg-up text-black";
+      return "bg-up/80 text-black";
     case "B":
       return "bg-cyan/80 text-black";
     case "C":
@@ -26,8 +32,24 @@ function gradeClass(g: ScanRow["grade"]) {
   }
 }
 
-export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, onSelect, onToggleAutoFollow }: Props) {
+const EMPTY: Record<Mode, (min: number) => string> = {
+  best: () =>
+    "No A+ trade right now. That is normal: A+ needs a setup scoring 8+, the model agreeing, no counter-trend and no losing record. Waiting is part of the strategy.",
+  setups: (min) => `No SnR setup (1–3) scoring ${min}+ on any pair right now.`,
+  pattern: (min) => `No wick liquidity sweep scoring ${min}+ on any pair right now.`,
+  every: (min) =>
+    `No pair clears your minimum of ${min * 10}% right now. The table still shows which way each pair leans. Lower the minimum in Settings if you want a call on every candle.`,
+};
+
+/** The live rule-based setup worth showing for a row: A+ first, then the stronger of SnR / wick. */
+function liveSetup(r: ScanRow): Signal | null {
+  if (r.best?.qualified) return r.best;
+  return [r.setup, r.pattern].filter((s): s is Signal => s !== null).sort((a, b) => b.score - a.score)[0] ?? null;
+}
+
+export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, mode, onSelect, onToggleAutoFollow }: Props) {
   const best = rows.find((r) => r.actionable) ?? null;
+  const bestSetup = best ? liveSetup(best) : null;
   return (
     <section className="card p-4">
       <div className="flex flex-wrap items-center gap-3 mb-3">
@@ -48,12 +70,12 @@ export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, o
             best.direction === "PUT" ? "border-down/60 bg-down/10" : "border-up/60 bg-up/10"
           }`}
         >
-          <div className="text-[11px] tracking-widest text-muted">BEST NOW</div>
+          <div className="text-[11px] tracking-widest text-muted">{best.grade === "A+" ? "A+ BEST OF BEST" : "BEST NOW"}</div>
           <div className={`text-xl font-black ${best.direction === "PUT" ? "text-down glow-red" : "text-up glow-green"}`}>
             {best.direction === "PUT" ? "SELL" : "BUY"} {best.label}
           </div>
           <div className="text-sm">
-            {best.pattern?.qualified ? "pattern" : `${pct(best.probability)} model`} · grade {best.grade}
+            {bestSetup ? `${bestSetup.setupLabel} · ${bestSetup.score}/10` : `${pct(best.probability)} model`} · grade {best.grade}
           </div>
           <div className="text-[11px] text-muted basis-full">{best.reason}</div>
           <button onClick={() => onSelect(best.id)} className="text-xs rounded-lg px-3 py-1.5 bg-panel border border-line hover:bg-panel-2">
@@ -61,10 +83,7 @@ export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, o
           </button>
         </div>
       ) : (
-        <div className="rounded-xl border border-line px-4 py-3 mb-3 text-sm text-muted">
-          No pair clears your minimum of {minScore * 10}% right now. The table still shows which way each
-          pair leans. Lower the minimum in Settings if you want a call on every candle.
-        </div>
+        <div className="rounded-xl border border-line px-4 py-3 mb-3 text-sm text-muted">{EMPTY[mode](minScore)}</div>
       )}
 
       <div className="overflow-auto">
@@ -77,7 +96,7 @@ export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, o
               <th className="pr-2">Prob.</th>
               <th className="pr-2">Strength</th>
               <th className="pr-2">Backtest support</th>
-              <th className="pr-2">Pattern</th>
+              <th className="pr-2">Setup</th>
               <th className="pr-2">Trend</th>
               <th className="pr-2">Candles</th>
               <th className="pr-2">Grade</th>
@@ -87,6 +106,10 @@ export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, o
           <tbody>
             {rows.map((r, i) => {
               const selected = r.id === selectedId;
+              const s = liveSetup(r);
+              const hist: [string, BacktestBucket][] = [];
+              if (r.setupWinRate) hist.push(["SnR", r.setupWinRate]);
+              if (r.patternWinRate) hist.push(["wick", r.patternWinRate]);
               return (
                 <tr
                   key={r.id}
@@ -100,7 +123,7 @@ export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, o
                   </td>
                   <td className={`pr-2 font-black ${r.direction === "PUT" ? "text-down" : r.direction === "CALL" ? "text-up" : "text-muted"}`}>
                     {r.direction === null ? "–" : r.direction === "PUT" ? "SELL" : "BUY"}
-                    {r.direction !== null && !r.qualified && !r.pattern?.qualified && (
+                    {r.direction !== null && !r.qualified && !s?.qualified && (
                       <span className="ml-1 text-[10px] font-normal text-muted">lean</span>
                     )}
                   </td>
@@ -127,13 +150,14 @@ export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, o
                     )}
                   </td>
                   <td className="pr-2 whitespace-nowrap">
-                    {r.pattern ? (
-                      <span className={r.pattern.qualified ? "text-amber font-bold" : "text-muted"}>
-                        {r.pattern.direction === "PUT" ? "SELL" : "BUY"} {r.pattern.score}/10
+                    {s ? (
+                      <span className={r.best?.qualified ? "text-up font-bold" : s.qualified ? "text-amber font-bold" : "text-muted"}>
+                        {r.best?.qualified && "A+ "}
+                        {SHORT[s.strategy ?? "wick"]} {side(s)} {s.score}/10
                       </span>
-                    ) : r.patternWinRate ? (
+                    ) : hist.length ? (
                       <span className="text-muted">
-                        hist {pct(r.patternWinRate.winRate)} ({r.patternWinRate.signals})
+                        {hist.map(([name, b]) => `${name} ${pct(b.winRate)} (${b.signals})`).join(" · ")}
                       </span>
                     ) : (
                       <span className="text-muted">–</span>
@@ -158,9 +182,10 @@ export default function ScannerBoard({ rows, selectedId, autoFollow, minScore, o
         </table>
       </div>
       <div className="text-[11px] text-muted mt-2 leading-relaxed">
-        Grade A: call clears your minimum and calls like it have beaten break‑even on this pair (30+ graded
-        trades). B: clears the minimum but too little history yet. C: clears the minimum but the backtest on
-        this pair says calls like it lose. A live pattern setup outranks everything.
+        A+: a rule-based setup (wick sweep or SnR 1–3) scored 8+, the every-candle model calls the same
+        way, it is not counter-trend, nothing points the other way, and that setup is not losing on this pair.
+        A+ outranks everything, then any live setup. Model grades: A beats break‑even on this pair (30+ graded
+        trades), B not enough history yet, C the backtest says calls like it lose here.
       </div>
     </section>
   );

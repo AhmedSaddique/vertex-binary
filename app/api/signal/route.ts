@@ -1,8 +1,6 @@
 import type { NextRequest } from "next/server";
-import { backtest } from "@/lib/backtest";
+import { analyze } from "@/lib/analyze";
 import { mockSeries } from "@/lib/mock";
-import { detectSignal, sentimentOf } from "@/lib/pattern";
-import { predictNext } from "@/lib/predict";
 import { fetchCandles, getSymbol, splitForming } from "@/lib/providers";
 import { DEFAULT_CONFIG, PatternConfig, SignalResponse } from "@/lib/types";
 
@@ -42,19 +40,13 @@ export async function GET(request: NextRequest) {
     const raw =
       mock === "PUT" || mock === "CALL" ? mockSeries(mock) : await fetchCandles(symbol, limit);
     const { closed, forming } = splitForming(raw);
-    const signal = detectSignal(closed, config);
-    const { prediction, backtest: predictionBacktest } = predictNext(closed, config);
     const payload: SignalResponse = {
       symbol,
       serverTime: Date.now(),
       candles: closed.slice(-120),
       forming,
-      signal,
-      sentiment: sentimentOf(closed),
-      backtest: backtest(closed, config),
       config,
-      prediction,
-      predictionBacktest,
+      ...analyze(closed, config),
     };
     return Response.json(payload);
   } catch (e) {

@@ -73,9 +73,36 @@ seconds it runs both engines on every bridged pair and ranks them:
 top‑ranked actionable pair, so you always see the single best trade across all your open OTC charts.
 Open more charts in Quotex to add pairs. Selecting a pair manually turns auto‑follow off.
 
-## Two modes
+## Modes
 
-- **Every candle** (default): on each candle close an adaptive ensemble in `lib/predict.ts` predicts
+Pick the mode from the **Mode** dropdown in the header.
+
+- **Best of best (A+)** (default): fires only when a rule-based setup (wick sweep or SnR setup 1–3)
+  passes every gate in `lib/best.ts` on the same closed candle: it scores 8/10 or more (or your minimum
+  if higher), it is not against the 30-candle trend, the every-candle model calls the same direction,
+  no other setup points the other way, and that setup is not losing on this pair (once it has 20+ graded
+  trades here, its walk-forward win rate must beat break-even). Confluence score = setup score + 0.5 per
+  extra agreeing setup + up to 1 for model conviction + 0.5 for a proven record. Expect very few signals.
+  The backtest grades **every qualified setup** against **A+ only**, so you can see whether the filter
+  actually helps on a pair.
+- **SnR setups 1–3** (`lib/snr.ts`). Strong levels are clusters of 2+ swing highs/lows (3 candles each
+  side) from the last 150 candles; trend is EMA 20/50 structure. All trades are taken on the next candle
+  with a 1‑minute expiry:
+  - **Setup 1, trend + SnR rejection**: uptrend at support (downtrend at resistance), a rejection candle
+    (far wick ≥ 30% of range) touches the level and closes back on the right side, and a green (red)
+    candle forms there → BUY at support / SELL at resistance.
+  - **Setup 2, SnR + trendline**: a strong level meets a rising (falling) trendline drawn through two
+    swing lows (highs) that price has respected; the rejection candle closes above (below) both → BUY in
+    the uptrend / SELL in the downtrend. The trendline is drawn on the chart.
+  - **Setup 3, breakout + retest**: a momentum candle (body ≥ 1.5× average and ≥ 55% of its range) closes
+    through a strong level, the breakout holds, price comes back to touch the level within 15 candles and
+    the first reversal candle closes back on the breakout side → BUY after a resistance break, SELL after
+    a support break. Chart marks: BO breakout, RT retest, RV reversal.
+
+  Levels and trendlines only use swing points confirmed before the signal candle, so the backtest has no
+  look‑ahead. Each setup also gets a 0–10 quality score (level touches, wick, trend strength, session, RSI).
+- **Wick sweep only**: the Wick Liquidity Sweep Reversal described below.
+- **Every candle**: on each candle close an adaptive ensemble in `lib/predict.ts` predicts
   the next candle. Ten simple voters (momentum, mean reversion, streak exhaustion, RSI, EMA 5/20,
   Bollinger touch, wick rejection, big‑candle exhaustion, close position, 10‑candle slope) are
   weighted by their recent walk‑forward accuracy on that pair and combined into a probability.
@@ -87,7 +114,7 @@ Open more charts in Quotex to add pairs. Selecting a pair manually turns auto‑
   feed with suspicion**: vendor 1‑minute forex candles carry bid/ask bounce and stale quotes that
   look like mean reversion but do not exist in Quotex's own prices. Only the bridge (Quotex's real
   stream) or your live trade log tells the truth for Quotex.
-- **Pattern only**: fires solely on the Wick Liquidity Sweep Reversal setup below.
+
 
 ## How a signal is produced
 
@@ -127,7 +154,10 @@ Strength dots = score ÷ 2.
 ## Project layout
 
 ```
-lib/pattern.ts        rule engine + confidence scoring
+lib/pattern.ts        wick sweep rule engine + confidence scoring
+lib/snr.ts            SnR setups 1-3 (trend + SnR rejection, SnR + trendline, breakout + retest)
+lib/best.ts           best-of-best (A+) confluence gates + walk-forward backtest
+lib/analyze.ts        runs every engine on a candle series (API route, relay path, scanner)
 lib/backtest.ts       walk‑forward grading on C4
 lib/providers/        Binance (free) and Twelve Data feeds, cached
 lib/mock.ts           synthetic series for the Demo button

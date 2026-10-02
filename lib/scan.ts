@@ -1,15 +1,13 @@
-import { backtest } from "./backtest";
-import { detectSignal, sentimentOf } from "./pattern";
-import { predictNext } from "./predict";
-import { BacktestBucket, Candle, Direction, PatternConfig, Sentiment, Signal } from "./types";
+import { analyze } from "./analyze";
+import { BacktestBucket, Candle, Direction, Mode, PatternConfig, Sentiment, Signal } from "./types";
 
 /**
- * Multi-asset scan: evaluates every bridged asset with both engines (pattern
- * setup + every-candle model) and grades how much the backtest on that asset
- * supports the current call, so the assets can be ranked side by side.
+ * Multi-asset scan: evaluates every bridged asset with all engines (A+ confluence,
+ * SnR setups, wick sweep, every-candle model) and grades how much the backtest on
+ * that asset supports the current call, so the assets can be ranked side by side.
  */
 
-export type Grade = "A" | "B" | "C" | "-";
+export type Grade = "A+" | "A" | "B" | "C" | "-";
 
 export interface ScanRow {
   id: string; // symbol id, e.g. QX:EURUSD_otc
@@ -19,22 +17,27 @@ export interface ScanRow {
   candles: number;
   lastPrice: number;
   sentiment: Sentiment;
-  /** model call for the candle that is forming now */
+  /** call for the candle that is forming now (A+ / setup direction when one is live, else the model) */
   direction: Direction | null;
   probability: number;
   strength: number;
   qualified: boolean;
   entryTime: number;
   expiryTime: number;
-  /** pattern setup currently live on this asset (may be unqualified) */
+  /** wick sweep setup currently live on this asset (may be unqualified) */
   pattern: Signal | null;
+  /** SnR setup currently live on this asset (may be unqualified) */
+  setup: Signal | null;
+  /** best-of-best candidate currently live; qualified = A+ */
+  best: Signal | null;
   /** backtest support for calls like this one on this asset */
   support: BacktestBucket | null;
   supportLabel: string;
   breakEven: number;
   patternWinRate: BacktestBucket | null;
+  setupWinRate: BacktestBucket | null;
   grade: Grade;
-  /** true when the board would tell you to take this trade now */
+  /** true when the board would tell you to take this trade now, in the current mode */
   actionable: boolean;
   rank: number;
   reason: string;
@@ -49,6 +52,7 @@ export function scanAsset(
   raw: Candle[],
   cfg: PatternConfig,
   live: boolean,
+  mode: Mode,
   now = Date.now(),
 ): ScanRow {
   const last = raw[raw.length - 1];
@@ -69,10 +73,13 @@ export function scanAsset(
     entryTime: 0,
     expiryTime: 0,
     pattern: null,
+    setup: null,
+    best: null,
     support: null,
     supportLabel: "",
     breakEven: 1 / (1 + cfg.payout),
     patternWinRate: null,
+    setupWinRate: null,
     grade: "-",
     actionable: false,
     rank: -1000,
@@ -80,11 +87,12 @@ export function scanAsset(
   };
   if (closed.length < 30) return base;
 
-  const sentiment = sentimentOf(closed);
-  const { prediction, backtest: pbt } = predictNext(closed, cfg);
-  const patternSig = detectSignal(closed, cfg);
-  const pattern = patternSig && now < patternSig.expiryTime ? patternSig : null;
-  const patternBt = backtest(closed, cfg);
+  const a = analyze(closed, cfg);
+  const { prediction, predictionBacktest: pbt, sentiment } = a;
+  const fresh = (s: Signal | null) => (s && now < s.expiryTime ? s : null);
+  const pattern = fresh(a.signal);
+  const setup = fresh(a.setup);
+  const best = fresh(a.best);
 
   if (!prediction) return { ...base, sentiment };
 
@@ -103,51 +111,70 @@ export function scanAsset(
   const enough = support.signals >= MIN_SUPPORT;
   const supported = enough && support.winRate > be;
 
-  let grade: Grade = "-";
+  let modelGrade: Grade = "-";
   let reason = `model leans ${prediction.direction === "CALL" ? "UP" : "DOWN"} at ${Math.round(prediction.probability * 100)}%, below your minimum`;
   if (prediction.qualified) {
     if (supported) {
-      grade = "A";
+      modelGrade = "A";
       reason = `${Math.round(prediction.probability * 100)}% call and ${supportLabel} won ${Math.round(support.winRate * 100)}% here (${support.signals} trades)`;
     } else if (!enough) {
-      grade = "B";
+      modelGrade = "B";
       reason = `${Math.round(prediction.probability * 100)}% call, but only ${support.signals} graded trades on this asset so far`;
     } else {
-      grade = "C";
+      modelGrade = "C";
       reason = `${Math.round(prediction.probability * 100)}% call, but ${supportLabel} only won ${Math.round(support.winRate * 100)}% here, below break-even`;
     }
   }
 
-  const patternQualified = Boolean(pattern?.qualified);
-  if (patternQualified) {
-    reason = `Wick Liquidity Sweep setup, score ${pattern!.score}/10 (${pattern!.direction === "PUT" ? "SELL" : "BUY"})`;
+  // strongest qualified rule-based setup live right now (wick sweep or SnR)
+  const rule = [pattern, setup]
+    .filter((s): s is Signal => Boolean(s?.qualified))
+    .sort((x, y) => y.score - x.score)[0] ?? null;
+  const aplus = Boolean(best?.qualified);
+  if (aplus) {
+    reason = `A+ ${best!.setupLabel}: confluence ${best!.score}/10, model agrees, not counter-trend`;
+  } else if (rule) {
+    reason = `${rule.setupLabel}, score ${rule.score}/10 (${rule.direction === "PUT" ? "SELL" : "BUY"})`;
+    const failed = best?.gates?.filter((g) => !g.pass).map((g) => g.label.toLowerCase());
+    if (failed?.length) reason += ` · not A+: ${failed.join(", ")}`;
   }
 
   const p = prediction.probability;
   let rank: number;
-  if (patternQualified) rank = 1000 + pattern!.score * 10;
-  else if (grade === "A") rank = 300 + p * 100 + (support.winRate - be) * 200;
-  else if (grade === "B") rank = 200 + p * 100;
-  else if (grade === "C") rank = 100 + p * 100;
+  if (aplus) rank = 2000 + best!.score * 10;
+  else if (rule) rank = 1000 + rule.score * 10;
+  else if (modelGrade === "A") rank = 300 + p * 100 + (support.winRate - be) * 200;
+  else if (modelGrade === "B") rank = 200 + p * 100;
+  else if (modelGrade === "C") rank = 100 + p * 100;
   else rank = p * 100;
-  if (!live) rank -= 500;
+  if (!live) rank -= 5000;
+
+  const actionableIn: Record<Mode, boolean> = {
+    best: aplus,
+    setups: Boolean(setup?.qualified),
+    pattern: Boolean(pattern?.qualified),
+    every: Boolean(pattern?.qualified) || modelGrade === "A" || modelGrade === "B",
+  };
 
   return {
     ...base,
     sentiment,
-    direction: patternQualified ? pattern!.direction : prediction.direction,
+    direction: aplus ? best!.direction : rule ? rule.direction : prediction.direction,
     probability: p,
     strength: prediction.strength,
     qualified: prediction.qualified,
     entryTime: prediction.entryTime,
     expiryTime: prediction.expiryTime,
     pattern,
+    setup,
+    best,
     support,
     supportLabel,
     breakEven: be,
-    patternWinRate: patternBt.all.signals ? patternBt.all : null,
-    grade,
-    actionable: live && (patternQualified || grade === "A" || grade === "B"),
+    patternWinRate: a.backtest.all.signals ? a.backtest.all : null,
+    setupWinRate: a.setupBacktest.all.signals ? a.setupBacktest.all : null,
+    grade: aplus ? "A+" : modelGrade,
+    actionable: live && actionableIn[mode],
     rank,
     reason,
   };

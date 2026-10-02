@@ -3,9 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CandleChart from "./CandleChart";
 import SignalDial, { DialMode } from "./SignalDial";
-import { backtest, outcomeOf } from "@/lib/backtest";
-import { detectSignal, sentimentOf } from "@/lib/pattern";
-import { Prediction, predictNext } from "@/lib/predict";
+import { analyze } from "@/lib/analyze";
+import { outcomeOf } from "@/lib/backtest";
+import { BEST_MIN_SCORE } from "@/lib/best";
+import { Prediction } from "@/lib/predict";
 import { rankRows, scanAsset } from "@/lib/scan";
 import ScannerBoard from "./ScannerBoard";
 import {
@@ -14,6 +15,7 @@ import {
   BacktestBucket,
   DEFAULT_CONFIG,
   Direction,
+  Mode,
   Outcome,
   PatternConfig,
   Signal,
@@ -33,9 +35,16 @@ interface LogEntry {
   strength: number;
   outcome: Outcome | "PENDING";
   c4Close?: number;
+  /** which setup fired it (A+ entries are prefixed) */
+  setup?: string;
 }
 
-type Mode = "pattern" | "every";
+const MODES: { id: Mode; label: string; title: string }[] = [
+  { id: "best", label: "Best of best (A+)", title: "Only A+ trades: a setup scoring 8+, model agrees, not counter-trend, setup not losing on this pair" },
+  { id: "setups", label: "SnR setups 1–3", title: "Setup 1 trend + SnR rejection, Setup 2 SnR + trendline, Setup 3 breakout + retest" },
+  { id: "pattern", label: "Wick sweep only", title: "Wick Liquidity Sweep Reversal setups only" },
+  { id: "every", label: "Every candle", title: "Model prediction on every candle close" },
+];
 
 interface Settings {
   mode: Mode;
@@ -51,7 +60,7 @@ interface Settings {
 }
 
 const DEFAULT_SETTINGS: Settings = {
-  mode: "every",
+  mode: "best",
   autoFollow: true,
   minScore: DEFAULT_CONFIG.minScore,
   payout: DEFAULT_CONFIG.payout,
@@ -98,6 +107,7 @@ function save(key: string, value: unknown) {
 const fmtTime = (ms: number) =>
   new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+const fmtPrice = (p: number) => p.toFixed(Math.abs(p) > 1000 ? 1 : Math.abs(p) > 10 ? 3 : 5);
 const dirLabel = (d: Direction) => (d === "PUT" ? "SELL (DOWN)" : "BUY (UP)");
 
 /** Present an every-candle prediction through the same Signal shape the dial, log and chart use. */
@@ -134,14 +144,26 @@ function predictionToSignal(p: Prediction, candles: Candle[], sentiment: Sentime
   };
 }
 
-/** In every-candle mode the model prediction takes the place of the pattern signal. */
-function applyMode(resp: SignalResponse, mode: Mode): SignalResponse {
-  if (mode !== "every") return resp;
-  return {
-    ...resp,
-    signal: resp.prediction ? predictionToSignal(resp.prediction, resp.candles, resp.sentiment) : null,
-    backtest: resp.predictionBacktest,
-  };
+/**
+ * Put the selected engine's signal and backtest into `signal` / `backtest`, which the dial,
+ * log and chart read. Demo candles only contain a wick sweep, so the demo shows that in
+ * every rule-based mode.
+ */
+function applyMode(resp: SignalResponse, mode: Mode, isDemo = false): SignalResponse {
+  switch (mode) {
+    case "every":
+      return {
+        ...resp,
+        signal: resp.prediction ? predictionToSignal(resp.prediction, resp.candles, resp.sentiment) : null,
+        backtest: resp.predictionBacktest,
+      };
+    case "setups":
+      return { ...resp, signal: isDemo ? resp.signal : resp.setup, backtest: resp.setupBacktest };
+    case "best":
+      return { ...resp, signal: isDemo ? resp.signal : resp.best, backtest: resp.bestBacktest };
+    default:
+      return resp;
+  }
 }
 
 export default function Dashboard() {
@@ -237,12 +259,12 @@ export default function Dashboard() {
     () =>
       rankRows(
         relay.assets.map((a) =>
-          scanAsset(`QX:${a.asset}`, a.asset, a.label, relayCandles(a.asset), scanConfig, a.live, scanNow),
+          scanAsset(`QX:${a.asset}`, a.asset, a.label, relayCandles(a.asset), scanConfig, a.live, settings.mode, scanNow),
         ),
       ),
     // relay.version changes whenever new candles arrive
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [relay.assets, relay.version, relayCandles, scanConfig, scanNow],
+    [relay.assets, relay.version, relayCandles, scanConfig, settings.mode, scanNow],
   );
   const scanRowsRef = useRef(scanRows);
   useEffect(() => {
@@ -310,6 +332,7 @@ export default function Dashboard() {
         if (settings.telegram && !isDemo) {
           const text =
             `<b>${dirLabel(fresh.direction)}</b> on <b>${resp.symbol.label}</b>\n` +
+            (fresh.setupLabel ? `${fresh.gates ? "A+ " : ""}${fresh.setupLabel}\n` : "") +
             `Enter at open of next candle (${fmtTime(fresh.entryTime)}), expiry 1 min\n` +
             `Score ${fresh.score}/10 · strength ${fresh.strength}/5 · ${fresh.sentiment.toLowerCase()} context`;
           fetch("/api/notify", {
@@ -337,6 +360,7 @@ export default function Dashboard() {
               score: fresh.score,
               strength: fresh.strength,
               outcome: "PENDING",
+              setup: fresh.setupLabel ? `${fresh.gates ? "A+ " : ""}${fresh.setupLabel}` : "Model",
             },
           ];
         }
@@ -360,8 +384,8 @@ export default function Dashboard() {
   const fetchSignal = useCallback(async () => {
     // scanner auto-follow: jump to the best actionable bridged pair
     if (!demo && settings.autoFollow) {
-      const best = scanRowsRef.current[0];
-      if (best && best.actionable && best.id !== symbolId) {
+      const best = scanRowsRef.current.find((r) => r.actionable);
+      if (best && best.id !== symbolId) {
         setSymbolId(best.id);
         return;
       }
@@ -390,19 +414,14 @@ export default function Dashboard() {
         };
         const sym = symbolsRef.current.find((s) => s.id === symbolId);
         if (sym) {
-          const { prediction, backtest: predictionBacktest } = predictNext(closed, config);
           const resp = applyMode(
             {
               symbol: sym,
               serverTime: now,
               candles: closed.slice(-120),
               forming,
-              signal: detectSignal(closed, config),
-              sentiment: sentimentOf(closed),
-              backtest: backtest(closed, config),
               config,
-              prediction,
-              predictionBacktest,
+              ...analyze(closed, config),
             },
             settings.mode,
           );
@@ -426,7 +445,7 @@ export default function Dashboard() {
       const res = await fetch(`/api/signal?${q}`, { cache: "no-store" });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
-      const resp = applyMode(json as SignalResponse, settings.mode);
+      const resp = applyMode(json as SignalResponse, settings.mode, Boolean(demo));
       setData(resp);
       setError(null);
       processResponse(resp, Boolean(demo));
@@ -485,12 +504,18 @@ export default function Dashboard() {
   const secToClose = 60 - Math.floor((now / 1000) % 60);
 
   const every = settings.mode === "every";
+  const bestMode = settings.mode === "best";
   const probText = live ? `${Math.round(live.score * 10)}%` : "";
+  const isWick = !live?.strategy || live.strategy === "wick";
+  const SCANNING: Record<Mode, string> = {
+    best: `Waiting for an A+ trade: a setup scoring ${Math.max(settings.minScore, BEST_MIN_SCORE)}+ that the model, the trend and the pair's record all agree with.`,
+    setups: "Watching for SnR rejection, SnR + trendline, and breakout + retest setups.",
+    pattern: "Watching the last three closed candles for a liquidity sweep.",
+    every: "Model predicts the next candle at every candle close.",
+  };
   let mode: DialMode = "WAIT";
   let headline = "SCANNING";
-  let sub = every
-    ? "Model predicts the next candle at every candle close."
-    : "Watching the last three closed candles for a liquidity sweep.";
+  let sub = SCANNING[settings.mode];
   let countdown = `next candle closes in ${secToClose}s`;
 
   if (error && !data) {
@@ -506,9 +531,17 @@ export default function Dashboard() {
     mode = live.direction;
     headline = live.direction === "PUT" ? "SELL (SHORT)" : "BUY (LONG)";
     const sinceEntry = now - live.entryTime;
-    const why = every ? `Model probability ${probText}.` : "";
+    const why = every
+      ? `Model probability ${probText}.`
+      : live.gates
+        ? `A+ ${live.setupLabel}, confluence ${live.score}/10.`
+        : isWick
+          ? ""
+          : `${live.setupLabel}, score ${live.score}/10.`;
     if (sinceEntry < 0) {
-      sub = every ? `${why} Enter at the open of the next candle.` : "C3 closed. Enter at the open of the next candle.";
+      sub = isWick && !every && !live.gates
+        ? "C3 closed. Enter at the open of the next candle."
+        : `${why} Enter at the open of the next candle.`;
       countdown = `enter in ${Math.ceil(-sinceEntry / 1000)}s`;
     } else if (sinceEntry < 20_000) {
       sub = `${why} ENTER NOW on ${data?.symbol.label}, 1-minute expiry. Entry window closes soon.`.trim();
@@ -519,10 +552,13 @@ export default function Dashboard() {
     }
   } else if (live && !live.qualified) {
     mode = "WEAK";
-    headline = every ? `LEAN ${live.direction === "PUT" ? "DOWN" : "UP"}` : "WEAK SETUP";
+    headline = every ? `LEAN ${live.direction === "PUT" ? "DOWN" : "UP"}` : bestMode ? "NOT A+" : "WEAK SETUP";
+    const failed = live.gates?.filter((g) => !g.pass).map((g) => g.label.toLowerCase()) ?? [];
     sub = every
       ? `Model leans ${dirLabel(live.direction)} at only ${probText}, below your minimum of ${settings.minScore * 10}%. No trade. Lower the minimum in Settings to trade every candle.`
-      : `Pattern matched (${dirLabel(live.direction)}) but score ${live.score}/10 is below your minimum of ${settings.minScore}. Skipped.`;
+      : bestMode
+        ? `${live.setupLabel} (${dirLabel(live.direction)}) found but failed: ${failed.join(", ")}. Skipped.`
+        : `${isWick ? "Pattern" : live.setupLabel} matched (${dirLabel(live.direction)}) but score ${live.score}/10 is below your minimum of ${settings.minScore}. Skipped.`;
   }
 
   const bt = data?.backtest;
@@ -550,7 +586,7 @@ export default function Dashboard() {
           </div>
           <div>
             <div className="font-black tracking-widest text-lg leading-none">VERTEX BINARY</div>
-            <div className="text-[11px] text-muted tracking-wider">WICK LIQUIDITY SWEEP · 1M REVERSAL SCANNER</div>
+            <div className="text-[11px] text-muted tracking-wider">SNR SETUPS · WICK SWEEP · A+ FILTER · 1M SCANNER</div>
           </div>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
@@ -586,13 +622,19 @@ export default function Dashboard() {
               Enable sound
             </button>
           )}
-          <button
-            onClick={() => setSettings({ ...settings, mode: settings.mode === "every" ? "pattern" : "every" })}
-            className={`text-xs border rounded-lg px-2 py-1.5 hover:bg-panel-2 ${settings.mode === "every" ? "border-cyan text-cyan" : "border-line"}`}
-            title="Every candle: model prediction on each candle close. Pattern only: Wick Liquidity Sweep setups only."
+          <select
+            aria-label="Signal mode"
+            className={`bg-panel border rounded-lg px-2 py-1.5 text-xs ${bestMode ? "border-up text-up" : "border-cyan text-cyan"}`}
+            value={settings.mode}
+            title={MODES.find((m) => m.id === settings.mode)?.title}
+            onChange={(e) => setSettings({ ...settings, mode: e.target.value as Mode })}
           >
-            {settings.mode === "every" ? "Mode: every candle" : "Mode: pattern only"}
-          </button>
+            {MODES.map((m) => (
+              <option key={m.id} value={m.id} title={m.title}>
+                Mode: {m.label}
+              </option>
+            ))}
+          </select>
           <button
             onClick={() => setDemo((d) => (d === null ? "PUT" : d === "PUT" ? "CALL" : null))}
             className={`text-xs border rounded-lg px-2 py-1.5 hover:bg-panel-2 ${demo ? "border-amber text-amber" : "border-line"}`}
@@ -629,6 +671,7 @@ export default function Dashboard() {
           selectedId={symbolId}
           autoFollow={settings.autoFollow}
           minScore={settings.minScore}
+          mode={settings.mode}
           onSelect={(id) => {
             setSettings({ ...settings, autoFollow: false });
             setSymbolId(id);
@@ -703,13 +746,15 @@ export default function Dashboard() {
             </div>
           </Stat>
 
-          <Stat title={every ? "MODEL PROBABILITY" : "CONFIDENCE SCORE"}>
+          <Stat title={every ? "MODEL PROBABILITY" : bestMode ? "CONFLUENCE SCORE" : "CONFIDENCE SCORE"}>
             <div className="text-3xl font-black">
               {scoreShown === undefined ? "–" : every ? `${Math.round(scoreShown * 10)}%` : scoreShown.toFixed(1)}
               {!every && <span className="text-base text-muted">/10</span>}
             </div>
             <div className="text-[11px] text-muted">
-              minimum to trade: {every ? `${settings.minScore * 10}%` : settings.minScore}
+              {bestMode
+                ? `setup needs ${Math.max(settings.minScore, BEST_MIN_SCORE)}+ and every A+ gate`
+                : `minimum to trade: ${every ? `${settings.minScore * 10}%` : settings.minScore}`}
             </div>
           </Stat>
 
@@ -723,7 +768,9 @@ export default function Dashboard() {
             </div>
             <div className="text-[11px] text-muted">
               {live && !every
-                ? `liquidity ${live.direction === "PUT" ? "above" : "below"} swept ✓`
+                ? isWick
+                  ? `liquidity ${live.direction === "PUT" ? "above" : "below"} swept ✓`
+                  : `${live.levelLabel} at ${fmtPrice(live.liquidityLevel)}`
                 : "30-candle regression context"}
             </div>
           </Stat>
@@ -764,8 +811,28 @@ export default function Dashboard() {
         </div>
 
         <div className="card p-4">
-          <div className="text-xs tracking-widest text-muted mb-3">{every ? "MODEL VOTES" : "SETUP CHECKLIST"}</div>
-          {live && every ? (
+          <div className="text-xs tracking-widest text-muted mb-3">
+            {every ? "MODEL VOTES" : bestMode ? "A+ CHECKLIST" : "SETUP CHECKLIST"}
+          </div>
+          {live && !every && (live.gates || !isWick) ? (
+            <ul className="flex flex-col gap-2">
+              {live.gates?.map((c) => (
+                <Check key={`gate-${c.id}`} ok={c.pass} label={c.label} detail={c.detail} />
+              ))}
+              {live.gates && (
+                <li className="text-[10px] tracking-widest text-muted border-t border-line pt-2 mt-1">
+                  {live.setupLabel?.toUpperCase()}
+                </li>
+              )}
+              {live.checks.map((c) => (
+                <Check key={c.id} ok={c.pass} label={c.label} detail={`${c.detail} · ${c.points.toFixed(1)}/${c.max}`} />
+              ))}
+              <li className="mt-2 text-xs text-muted border-t border-line pt-2">
+                Enter at the open of the next candle, 1-minute expiry. Risk 1–2% per trade · stop after{" "}
+                {settings.maxConsecutiveLosses} losses · no martingale.
+              </li>
+            </ul>
+          ) : live && every ? (
             <ul className="flex flex-col gap-2">
               {live.checks.map((c) => (
                 <Check key={c.id} ok={c.pass} label={c.label} detail={c.detail} />
@@ -802,6 +869,37 @@ export default function Dashboard() {
                 Votes are weighted by each voter&apos;s recent accuracy on this pair. The result is a
                 probability for the next candle; you trade when it clears your minimum.
               </p>
+            </div>
+          ) : bestMode ? (
+            <div className="text-sm text-muted leading-relaxed">
+              <p>An A+ trade fires only when all of these line up on the same closed candle:</p>
+              <ol className="list-decimal ml-5 mt-2 space-y-1">
+                <li>A setup fires: wick sweep or SnR setup 1, 2 or 3.</li>
+                <li>It scores {Math.max(settings.minScore, BEST_MIN_SCORE)}/10 or more.</li>
+                <li>It is not against the 30-candle trend.</li>
+                <li>The every-candle model independently calls the same direction.</li>
+                <li>No other setup points the opposite way.</li>
+                <li>That setup is not losing on this pair (after 20+ graded trades it must beat break-even).</li>
+              </ol>
+              <p className="mt-2">Expect only a few per session. Enter at the open of the next candle, 1-minute expiry.</p>
+            </div>
+          ) : settings.mode === "setups" ? (
+            <div className="text-sm text-muted leading-relaxed">
+              <p>Strong SnR levels are swing highs/lows touched 2+ times. On closed candles:</p>
+              <ol className="list-decimal ml-5 mt-2 space-y-1">
+                <li>
+                  <b className="text-text">Setup 1</b>: uptrend at support / downtrend at resistance, a rejection
+                  candle closes and a green / red candle forms there → BUY at S, SELL at R next candle.
+                </li>
+                <li>
+                  <b className="text-text">Setup 2</b>: SnR level meets a trendline, rejection candle closes above
+                  (below) both → BUY in uptrend, SELL in downtrend next candle.
+                </li>
+                <li>
+                  <b className="text-text">Setup 3</b>: momentum candle breaks a strong level, price retests it and a
+                  reversal candle forms → BUY after a resistance break, SELL after a support break, only after the retest.
+                </li>
+              </ol>
             </div>
           ) : (
             <div className="text-sm text-muted leading-relaxed">
@@ -840,6 +938,22 @@ export default function Dashboard() {
                   </div>
                 ))}
               </div>
+              {bt.byStrategy && (
+                <>
+                  <div className="text-[11px] text-muted mb-1">By setup</div>
+                  <div className="flex flex-wrap gap-1 mb-3">
+                    {bt.byStrategy.map((b) => (
+                      <div key={b.label} className="rounded-lg bg-panel border border-line px-2 py-1 text-xs">
+                        {b.label}:{" "}
+                        <b className={b.signals && b.winRate > bt.breakEven ? "text-up" : ""}>
+                          {b.signals ? pct(b.winRate) : "–"}
+                        </b>{" "}
+                        <span className="text-muted">({b.signals})</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
               <div className="text-[11px] text-muted mb-1">By session (UTC)</div>
               <div className="flex flex-wrap gap-1">
                 {bt.bySession.map((b) => (
@@ -881,6 +995,7 @@ export default function Dashboard() {
                   <tr>
                     <th className="py-1">Entry</th>
                     <th>Pair</th>
+                    <th>Setup</th>
                     <th>Dir</th>
                     <th>Score</th>
                     <th>Result</th>
@@ -891,6 +1006,9 @@ export default function Dashboard() {
                     <tr key={e.id} className="border-t border-line">
                       <td className="py-1.5 mono">{fmtTime(e.entryTime)}</td>
                       <td>{e.label}</td>
+                      <td className="text-muted text-[11px] max-w-36 truncate" title={e.setup}>
+                        {e.setup ?? "–"}
+                      </td>
                       <td className={e.direction === "PUT" ? "text-down" : "text-up"}>
                         {e.direction === "PUT" ? "DOWN" : "UP"}
                       </td>
@@ -916,8 +1034,9 @@ export default function Dashboard() {
       </section>
 
       <footer className="text-[11px] text-muted leading-relaxed pb-6">
-        Educational tool. Signals are generated mechanically from the Wick Liquidity Sweep Reversal rules
-        and graded on the following candle. Past win rates do not guarantee future results. Binary options
+        Educational tool. Signals are generated mechanically from the SnR setups, the Wick Liquidity Sweep
+        Reversal rules and the every-candle model, and graded on the following candle. A+ is a filter, not a
+        promise: it only stacks independent checks. Past win rates do not guarantee future results. Binary options
         can lose your whole stake. Quotex has no official API, so this scanner reads a real-market data feed
         and you place trades yourself; OTC prices on Quotex are synthetic and can differ from any feed.
       </footer>

@@ -27,9 +27,26 @@ export default function CandleChart({ candles, forming, signal, count = 40 }: Pr
   const bw = Math.max(2, slot * 0.6);
   const x = (i: number) => padX + i * slot + slot / 2;
 
-  const patternTimes = signal ? new Set([signal.c1.time, signal.c2.time, signal.c3.time]) : new Set<number>();
+  const marks = new Map(
+    (signal?.marks ?? (signal ? [
+      { time: signal.c1.time, label: "C1" },
+      { time: signal.c2.time, label: "C2" },
+      { time: signal.c3.time, label: "C3" },
+    ] : [])).map((m) => [m.time, m.label]),
+  );
+  const entryLabel = signal?.strategy && signal.strategy !== "wick" ? "IN" : "C4";
   const decimals = hi > 1000 ? 1 : hi > 10 ? 3 : 5;
   const last = all[all.length - 1];
+  // candles are one minute apart, so a time maps to a slot even when it is off-screen
+  const xAt = (t: number) => x(all.length - 1 - (last.time - t) / 60_000);
+  let trend: { x1: number; y1: number; x2: number; y2: number } | null = null;
+  if (signal?.trendline) {
+    const { t1, p1, t2, p2 } = signal.trendline;
+    const at = (t: number) => p1 + ((p2 - p1) * (t - t1)) / (t2 - t1);
+    const from = Math.max(t1, all[0].time);
+    const to = signal.entryTime;
+    trend = { x1: xAt(from), y1: y(at(from)), x2: xAt(to), y2: y(at(to)) };
+  }
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto select-none" role="img" aria-label="1-minute candles">
@@ -57,8 +74,23 @@ export default function CandleChart({ candles, forming, signal, count = 40 }: Pr
             strokeWidth="1.5"
           />
           <text x={padX + 4} y={y(signal.liquidityLevel) - 4} fill="#ffb020" fontSize="11" fontFamily="monospace">
-            liquidity {signal.liquidityLevel.toFixed(decimals)}
+            {signal.levelLabel ?? "liquidity"} {signal.liquidityLevel.toFixed(decimals)}
           </text>
+        </g>
+      )}
+
+      {trend && (
+        <g>
+          <clipPath id="plot">
+            <rect x={padX} y={padY} width={W - right - padX} height={H - padY * 2} />
+          </clipPath>
+          <line
+            {...trend}
+            clipPath="url(#plot)"
+            stroke="#2dd4ff"
+            strokeWidth="1.5"
+            strokeDasharray="4 3"
+          />
         </g>
       )}
 
@@ -66,7 +98,8 @@ export default function CandleChart({ candles, forming, signal, count = 40 }: Pr
         const up = c.close >= c.open;
         const col = up ? "#22ff88" : "#ff2d55";
         const isForming = forming && i === all.length - 1;
-        const inPattern = patternTimes.has(c.time);
+        const mark = marks.get(c.time);
+        const inPattern = mark !== undefined;
         const isC4 = signal && c.time === signal.entryTime;
         const top = y(Math.max(c.open, c.close));
         const bot = y(Math.min(c.open, c.close));
@@ -95,12 +128,12 @@ export default function CandleChart({ candles, forming, signal, count = 40 }: Pr
             />
             {inPattern && (
               <text x={x(i)} y={H - 2} textAnchor="middle" fill="#ffb020" fontSize="10" fontFamily="monospace">
-                {c.time === signal!.c1.time ? "C1" : c.time === signal!.c2.time ? "C2" : "C3"}
+                {mark}
               </text>
             )}
             {isC4 && (
               <text x={x(i)} y={H - 2} textAnchor="middle" fill="#2dd4ff" fontSize="10" fontFamily="monospace">
-                C4
+                {entryLabel}
               </text>
             )}
           </g>

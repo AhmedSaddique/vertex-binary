@@ -13,9 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Vertex Binary · Wick Liquidity Sweep Scanner",
+  title: "Vertex Binary · 1M Setup Scanner",
   description:
-    "1-minute binary options signal scanner based on the Wick Liquidity Sweep Reversal pattern, with live backtesting.",
+    "1-minute binary options signal scanner: SnR setups, Wick Liquidity Sweep Reversal and an A+ confluence filter, with live backtesting.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
